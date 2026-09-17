@@ -1,0 +1,4 @@
+build/
+work/
+outputs/
+.DS_Store
