@@ -1,3 +1,6 @@
+// Release 下 NDEBUG 会把 assert 变成空操作，测试断言就全废了——
+// 测试文件必须取消 NDEBUG，让断言在任何配置下都真正执行。
+#undef NDEBUG
 #include <cassert>
 #include <filesystem>
 #include <fstream>
