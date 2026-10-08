@@ -16,9 +16,14 @@ namespace cse::ui {
 class ComponentLibraryPanel;
 class PropertiesPanel;
 class SchematicCanvas;
+class SimulationDialog;
 
 enum MainFrameCommandId {
     kMenuNew = wxID_HIGHEST + 1,
+    kMenuOpen,
+    kMenuSaveProject,
+    kMenuExportNetlist,
+    kMenuSimulate,
     kMenuExit,
     kMenuUndo,
     kMenuRedo,
@@ -48,6 +53,10 @@ private:
     void BuildToolBar();
     void BuildContent();
     void OnNew(wxCommandEvent& event);
+    void OnOpen(wxCommandEvent& event);
+    void OnSaveProject(wxCommandEvent& event);
+    void OnExportNetlist(wxCommandEvent& event);
+    void OnSimulate(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnSelectTool(wxCommandEvent& event);
     void OnWireTool(wxCommandEvent& event);
@@ -68,6 +77,7 @@ private:
     SchematicCanvas* panel_canvas_{nullptr};
     ComponentLibraryPanel* panel_component_library_{nullptr};
     PropertiesPanel* panel_properties_{nullptr};
+    SimulationDialog* simulation_dialog_{nullptr};  // 非模态，关闭时自己销毁并回调置空
 };
 
 }  // namespace cse::ui

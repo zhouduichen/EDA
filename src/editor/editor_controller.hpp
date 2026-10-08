@@ -54,6 +54,7 @@ public:
     bool CanRedo() const;
 
     SchematicSnapshot GetSnapshot() const override;
+    void LoadSnapshot(const SchematicSnapshot& snapshot);
     std::optional<ComponentInstance> GetComponent(ComponentId id) const override;
     SelectionState GetSelection() const override;
 

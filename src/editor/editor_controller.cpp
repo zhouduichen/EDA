@@ -233,6 +233,24 @@ SchematicSnapshot EditorController::GetSnapshot() const {
     return model_.GetSnapshot();
 }
 
+// 整体替换模型内容，用于打开工程文件。替换是破坏性的：
+// 撤销/重做栈和选区一起清空，历史对不上新图。
+void EditorController::LoadSnapshot(const SchematicSnapshot& snapshot) {
+    pending_wire_.reset();
+    selection_ = {};
+    undo_stack_.clear();
+    redo_stack_.clear();
+    model_.Clear();
+    for (const ComponentInstance& component : snapshot.components) {
+        static_cast<void>(model_.AddComponent(component));
+    }
+    for (const WireModel& wire : snapshot.wires) {
+        WireModel copy = wire;
+        static_cast<void>(model_.AddWire(copy));
+    }
+    NotifyModelChanged();
+}
+
 std::optional<ComponentInstance> EditorController::GetComponent(ComponentId id) const {
     return model_.GetComponent(id);
 }

@@ -9,6 +9,7 @@
 #include "contracts/ids.hpp"
 #include "contracts/wire_model.hpp"
 #include "src/editor/editor_controller.hpp"
+#include "src/sim/logic_simulator.hpp"
 
 class wxKeyEvent;
 class wxMouseEvent;
@@ -25,6 +26,11 @@ public:
     void ZoomIn();
     void ZoomOut();
     void FitContent();
+
+    // 仿真可视化：传入结果后导线按电平着色、IO 元件显示电平徽标；
+    // 传 nullopt 恢复普通显示。
+    void SetSimulationResult(std::optional<cse::sim::SimulationResult> result);
+    bool IsSimulating() const { return simulation_.has_value(); }
 
 private:
     struct PinHit {
@@ -58,6 +64,9 @@ private:
     void DrawTemporaryWire(wxDC& dc);
     void RefreshEditorViews();
 
+    wxColour WireColour(LogicValue value) const;
+    std::optional<LogicValue> PinValue(ComponentId component_id, PinId pin_id) const;
+
     editor::EditorController& editor_;
     const IComponentLibrary& library_;
     double zoom_{1.0};
@@ -69,6 +78,7 @@ private:
     std::optional<Point2D> drag_preview_position_;
     Point2D pan_start_offset_;
     wxPoint pan_start_screen_;
+    std::optional<cse::sim::SimulationResult> simulation_;
 };
 
 }  // namespace cse::ui

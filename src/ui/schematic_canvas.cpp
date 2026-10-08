@@ -53,6 +53,35 @@ wxColour PinColour(PinDirection direction) {
     return wxColour(150, 150, 150);
 }
 
+// 仿真可视化配色（同仿真对话框图例）：红=1，绿=0，橙=X（未知），灰=Z。
+wxColour LogicColour(LogicValue value) {
+    switch (value) {
+        case LogicValue::kHigh:
+            return wxColour(214, 48, 49);
+        case LogicValue::kLow:
+            return wxColour(9, 158, 90);
+        case LogicValue::kUnknown:
+            return wxColour(235, 160, 40);
+        case LogicValue::kHighImpedance:
+            return wxColour(140, 140, 140);
+    }
+    return wxColour(140, 140, 140);
+}
+
+wchar_t LogicChar(LogicValue value) {
+    switch (value) {
+        case LogicValue::kHigh:
+            return L'1';
+        case LogicValue::kLow:
+            return L'0';
+        case LogicValue::kUnknown:
+            return L'X';
+        case LogicValue::kHighImpedance:
+            return L'Z';
+    }
+    return L'?';
+}
+
 }  // namespace
 
 SchematicCanvas::SchematicCanvas(wxWindow* parent, editor::EditorController& editor,
@@ -68,6 +97,11 @@ SchematicCanvas::SchematicCanvas(wxWindow* parent, editor::EditorController& edi
     Bind(wxEVT_RIGHT_DOWN, &SchematicCanvas::OnMouseRightDown, this);
     Bind(wxEVT_MOUSEWHEEL, &SchematicCanvas::OnMouseWheel, this);
     Bind(wxEVT_KEY_DOWN, &SchematicCanvas::OnKeyDown, this);
+}
+
+void SchematicCanvas::SetSimulationResult(std::optional<cse::sim::SimulationResult> result) {
+    simulation_ = std::move(result);
+    RefreshEditorViews();
 }
 
 void SchematicCanvas::ZoomIn() {
@@ -402,17 +436,54 @@ void SchematicCanvas::DrawGrid(wxDC& dc) {
     }
 }
 
+wxColour SchematicCanvas::WireColour(LogicValue value) const {
+    return LogicColour(value);
+}
+
+std::optional<LogicValue> SchematicCanvas::PinValue(ComponentId component_id,
+                                                    PinId pin_id) const {
+    if (!simulation_.has_value()) {
+        return std::nullopt;
+    }
+    const auto iterator = simulation_->pin_values.find(PinKey(component_id, pin_id));
+    return iterator != simulation_->pin_values.end()
+               ? std::optional<LogicValue>(iterator->second)
+               : std::nullopt;
+}
+
 void SchematicCanvas::DrawWires(wxDC& dc, const SchematicSnapshot& snapshot) {
     for (const WireModel& wire : snapshot.wires) {
-        const wxColour colour = IsWireSelected(wire.id) ? wxColour(210, 75, 60)
-                                                    : wxColour(40, 115, 150);
-        dc.SetPen(wxPen(colour, IsWireSelected(wire.id) ? 3 : 2));
+        wxColour colour;
+        int width = 2;
+        std::optional<LogicValue> value;
+        if (simulation_.has_value()) {
+            const auto value_iterator = simulation_->wire_values.find(wire.id);
+            if (value_iterator != simulation_->wire_values.end()) {
+                value = value_iterator->second;
+            }
+        }
+        if (IsWireSelected(wire.id)) {
+            colour = wxColour(210, 75, 60);
+            width = 3;
+        } else if (value.has_value()) {
+            colour = WireColour(*value);
+            width = 3;
+        } else {
+            colour = wxColour(40, 115, 150);
+        }
+        dc.SetPen(wxPen(colour, width));
         std::vector<Point2D> points;
         points.push_back(ResolveEndpoint(wire.from));
         points.insert(points.end(), wire.route_points.begin(), wire.route_points.end());
         points.push_back(ResolveEndpoint(wire.to));
         for (std::size_t index = 1; index < points.size(); ++index) {
             dc.DrawLine(ModelToScreen(points[index - 1]), ModelToScreen(points[index]));
+        }
+        // 悬空导线（没接入任何网络）在仿真态画个小问号提示。
+        if (simulation_.has_value() && !value.has_value()) {
+            const Point2D middle{(points.front().x + points.back().x) / 2.0,
+                                 (points.front().y + points.back().y) / 2.0};
+            dc.DrawText(L"?", ModelToScreen(middle));
         }
     }
 }
@@ -507,6 +578,37 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
             dc.SetBrush(wxBrush(PinColour(pin.direction)));
             dc.DrawCircle(screen_pin, std::max(3, static_cast<int>(std::lround(3.0 * zoom_))));
         }
+        // 仿真可视化：io 元件头顶画电平徽标（红 1 / 绿 0 / 橙 X / 灰 Z）。
+        if (simulation_.has_value() &&
+            (component.type_id == "io.input" || component.type_id == "io.output")) {
+            const PinDirection wanted = component.type_id == "io.input"
+                                            ? PinDirection::kOutput
+                                            : PinDirection::kInput;
+            std::optional<LogicValue> value;
+            for (const PinDefinition& pin : definition->pins) {
+                if (pin.direction == wanted) {
+                    value = PinValue(component.id, pin.local_id);
+                    break;
+                }
+            }
+            if (value.has_value()) {
+                const wxPoint badge_center = ModelToScreen(
+                    {component.position.x + definition->default_bounds.width / 2.0,
+                     component.position.y - 10.0});
+                const int radius =
+                    std::max(6, static_cast<int>(std::lround(7.0 * zoom_)));
+                dc.SetPen(wxPen(*wxBLACK, 1));
+                dc.SetBrush(wxBrush(WireColour(*value)));
+                dc.DrawCircle(badge_center, radius);
+                const wxString character(LogicChar(*value));
+                const wxSize char_size = dc.GetTextExtent(character);
+                dc.SetTextForeground(*wxWHITE);
+                dc.DrawText(character, badge_center.x - char_size.x / 2,
+                            badge_center.y - char_size.y / 2);
+                dc.SetTextForeground(*wxBLACK);
+            }
+        }
+
         dc.SetTextForeground(wxColour(80, 85, 95));
         dc.DrawText(component.reference, top_left.x, top_left.y + height + 3);
         dc.SetTextForeground(*wxBLACK);

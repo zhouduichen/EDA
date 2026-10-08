@@ -21,6 +21,7 @@ public:
     bool AddComponent(ComponentInstance component);
     bool RemoveComponentAndWires(ComponentId component_id, ComponentRemoval* removal);
     bool RestoreComponent(const ComponentRemoval& removal);
+    void Clear();
 
     bool SetComponentPosition(ComponentId component_id, Point2D position);
     bool SetComponentRotation(ComponentId component_id, double rotation_deg);

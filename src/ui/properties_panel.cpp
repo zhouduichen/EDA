@@ -27,8 +27,8 @@ PropertiesPanel::PropertiesPanel(wxWindow* parent, const editor::EditorControlle
     property_table_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                      wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES);
     property_table_->SetName("table_properties");
-    property_table_->InsertColumn(0, "属性");
-    property_table_->InsertColumn(1, "值");
+    property_table_->InsertColumn(0, L"属性");
+    property_table_->InsertColumn(1, L"值");
     property_table_->SetColumnWidth(0, 100);
     property_table_->SetColumnWidth(1, 180);
     auto* outer_sizer = new wxBoxSizer(wxVERTICAL);
@@ -56,7 +56,7 @@ void PropertiesPanel::RefreshFromSelection() {
     add_row("Type", component->type_id);
     add_row("Reference", component->reference);
     add_row("Position", FormatPoint(component->position));
-    add_row("Rotation", wxString::Format("%.0f°", component->rotation_deg));
+    add_row("Rotation", wxString::Format(L"%.0f°", component->rotation_deg));
 
     std::vector<std::pair<std::string, std::string>> entries(component->properties.begin(),
                                                              component->properties.end());

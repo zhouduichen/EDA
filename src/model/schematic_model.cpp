@@ -90,6 +90,14 @@ bool SchematicModel::RestoreComponent(const ComponentRemoval& removal) {
     return true;
 }
 
+void SchematicModel::Clear() {
+    components_.clear();
+    wires_.clear();
+    next_component_id_ = 1;
+    next_wire_id_ = 1;
+    BumpRevision();
+}
+
 bool SchematicModel::SetComponentPosition(ComponentId component_id, Point2D position) {
     const auto iterator = components_.find(component_id);
     if (iterator == components_.end()) {

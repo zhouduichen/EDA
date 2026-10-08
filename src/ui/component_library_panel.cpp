@@ -44,7 +44,7 @@ void ComponentLibraryPanel::SetComponentActivatedHandler(ComponentActivatedHandl
 
 void ComponentLibraryPanel::PopulateTree() {
     tree_component_library_->DeleteAllItems();
-    const wxTreeItemId root = tree_component_library_->AddRoot("元件库");
+    const wxTreeItemId root = tree_component_library_->AddRoot(L"元件库");
     std::map<std::string, wxTreeItemId> category_items;
     for (const ComponentDefinition& definition : library_.GetAll()) {
         wxTreeItemId category_item;
