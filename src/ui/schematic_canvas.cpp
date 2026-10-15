@@ -4,15 +4,25 @@
 #include <cmath>
 #include <limits>
 
+#include <wx/cursor.h>
 #include <wx/dcbuffer.h>
 #include <wx/dc.h>
 #include <wx/settings.h>
+
+#include "src/model/wire_route.hpp"
 
 namespace cse::ui {
 
 namespace {
 
 constexpr double kPinHitRadius = 8.0;
+constexpr double kWireHitRadius = 6.0;
+constexpr double kPointEpsilon = 0.000001;
+
+bool SamePoint(Point2D first, Point2D second) {
+    return std::abs(first.x - second.x) < kPointEpsilon &&
+           std::abs(first.y - second.y) < kPointEpsilon;
+}
 
 double DistanceSquared(Point2D first, Point2D second) {
     const double dx = first.x - second.x;
@@ -20,17 +30,48 @@ double DistanceSquared(Point2D first, Point2D second) {
     return dx * dx + dy * dy;
 }
 
-double DistanceToSegmentSquared(Point2D point, Point2D start, Point2D end) {
-    const double dx = end.x - start.x;
-    const double dy = end.y - start.y;
-    const double length_squared = dx * dx + dy * dy;
-    if (length_squared <= std::numeric_limits<double>::epsilon()) {
-        return DistanceSquared(point, start);
+// 布线时的"当前锚点"：有拐点就是最后一个拐点，否则是最初按下的引脚。
+Point2D WireAnchorPoint(const editor::PendingWire& pending_wire) {
+    return pending_wire.route_points.empty() ? pending_wire.start_position
+                                             : pending_wire.route_points.back();
+}
+
+// 这一跳的起点是不是挂在真正的引脚上：只有还没打任何拐点的第一跳才是，
+// 之后的锚点是画布上定的拐点，避让时不享受"自己人"待遇。
+std::optional<PinRef> WireAnchorPin(const editor::PendingWire& pending_wire) {
+    if (pending_wire.route_points.empty()) {
+        return pending_wire.start_pin;
     }
-    const double parameter = std::clamp(
-        ((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared, 0.0, 1.0);
-    const Point2D projection{start.x + parameter * dx, start.y + parameter * dy};
-    return DistanceSquared(point, projection);
+    return std::nullopt;
+}
+
+// 折线长度中点：给悬空导线的「?」标记找个确实落在线上的位置。
+Point2D PolylineMidPoint(const std::vector<Point2D>& points) {
+    if (points.empty()) {
+        return {0.0, 0.0};
+    }
+    if (points.size() == 1) {
+        return points.front();
+    }
+    double total_length = 0.0;
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        total_length += std::sqrt(DistanceSquared(points[index - 1], points[index]));
+    }
+    if (total_length <= std::numeric_limits<double>::epsilon()) {
+        return points.front();
+    }
+    const double half_length = total_length / 2.0;
+    double travelled = 0.0;
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        const double length = std::sqrt(DistanceSquared(points[index - 1], points[index]));
+        if (length > 0.0 && travelled + length >= half_length) {
+            const double ratio = (half_length - travelled) / length;
+            return {points[index - 1].x + (points[index].x - points[index - 1].x) * ratio,
+                    points[index - 1].y + (points[index].y - points[index - 1].y) * ratio};
+        }
+        travelled += length;
+    }
+    return points.back();
 }
 
 int NormalizeQuarterTurn(double rotation_deg) {
@@ -93,9 +134,11 @@ SchematicCanvas::SchematicCanvas(wxWindow* parent, editor::EditorController& edi
     Bind(wxEVT_PAINT, &SchematicCanvas::OnPaint, this);
     Bind(wxEVT_LEFT_DOWN, &SchematicCanvas::OnMouseLeftDown, this);
     Bind(wxEVT_LEFT_UP, &SchematicCanvas::OnMouseLeftUp, this);
+    Bind(wxEVT_LEFT_DCLICK, &SchematicCanvas::OnMouseLeftDoubleClick, this);
     Bind(wxEVT_MOTION, &SchematicCanvas::OnMouseMove, this);
     Bind(wxEVT_RIGHT_DOWN, &SchematicCanvas::OnMouseRightDown, this);
     Bind(wxEVT_MOUSEWHEEL, &SchematicCanvas::OnMouseWheel, this);
+    Bind(wxEVT_MOUSE_CAPTURE_LOST, &SchematicCanvas::OnMouseCaptureLost, this);
     Bind(wxEVT_KEY_DOWN, &SchematicCanvas::OnKeyDown, this);
 }
 
@@ -127,9 +170,11 @@ void SchematicCanvas::OnPaint(wxPaintEvent& event) {
     dc.SetBackground(wxBrush(wxColour(248, 249, 251)));
     dc.Clear();
     DrawGrid(dc);
-    const SchematicSnapshot snapshot = editor_.GetSnapshot();
+    SchematicSnapshot snapshot = editor_.GetSnapshot();
+    ApplyDragPreview(snapshot);
     DrawWires(dc, snapshot);
     DrawComponents(dc, snapshot);
+    DrawDragOriginMarker(dc, snapshot);
     DrawTemporaryWire(dc);
 }
 
@@ -147,17 +192,18 @@ void SchematicCanvas::OnMouseLeftDown(wxMouseEvent& event) {
     }
 
     if (tool_mode == ToolMode::kWire) {
-        const std::optional<PinHit> pin_hit = HitPin(last_mouse_model_);
-        if (pin_hit.has_value()) {
-            const std::optional<editor::PendingWire> pending_wire = editor_.GetPendingWire();
-            const bool success = pending_wire.has_value()
-                                     ? editor_.CompleteWire(pin_hit->pin, pin_hit->position)
-                                     : editor_.BeginWire(pin_hit->pin, pin_hit->position);
-            if (!success) {
+        const WireTarget target = ComputeWireTarget(last_mouse_model_, editor_.GetSnapshot());
+        if (editor_.GetPendingWire().has_value()) {
+            CommitWireSegment(target);
+        } else if (target.kind == WireTarget::Kind::kPin) {
+            if (!editor_.BeginWire(target.pin, target.position)) {
                 wxBell();
             }
-            RefreshEditorViews();
+        } else {
+            wxBell();  // 连线从引脚上起笔
         }
+        wire_target_ = target;
+        RefreshEditorViews();
         return;
     }
 
@@ -170,12 +216,10 @@ void SchematicCanvas::OnMouseLeftDown(wxMouseEvent& event) {
 
     const std::optional<ComponentId> component_id = HitComponent(last_mouse_model_);
     if (component_id.has_value()) {
-        editor_.SelectComponent(*component_id);
         const std::optional<ComponentInstance> component = editor_.GetComponent(*component_id);
         if (component.has_value()) {
-            dragging_component_ = true;
-            dragging_component_id_ = *component_id;
-            drag_preview_position_ = component->position;
+            editor_.SelectComponent(*component_id);
+            BeginComponentDrag(*component_id, last_mouse_model_);
             CaptureMouse();
         }
     } else {
@@ -192,24 +236,41 @@ void SchematicCanvas::OnMouseLeftDown(wxMouseEvent& event) {
 void SchematicCanvas::OnMouseLeftUp(wxMouseEvent& event) {
     static_cast<void>(event);
     if (dragging_component_) {
-        if (drag_preview_position_.has_value()) {
-            static_cast<void>(editor_.MoveComponent(dragging_component_id_,
-                                                     *drag_preview_position_));
-        }
-        dragging_component_ = false;
-        dragging_component_id_ = kInvalidComponentId;
-        drag_preview_position_.reset();
+        EndComponentDrag();
     }
     if (HasCapture()) {
         ReleaseMouse();
     }
+    UpdateHoverCursor(last_mouse_model_);
+    RefreshEditorViews();
+}
+
+// 双击收尾：连线时在空白处双击 = 就以那个点结束；双击引脚则直接连上去。
+void SchematicCanvas::OnMouseLeftDoubleClick(wxMouseEvent& event) {
+    last_mouse_model_ = ScreenToModel(event.GetPosition());
+    if (editor_.GetToolMode() != ToolMode::kWire || !editor_.GetPendingWire().has_value()) {
+        event.Skip();
+        return;
+    }
+    const WireTarget target = ComputeWireTarget(last_mouse_model_, editor_.GetSnapshot());
+    if (target.kind == WireTarget::Kind::kPin) {
+        CommitWireSegment(target);
+    } else if (!editor_.CompleteWireAtPoint(target.position)) {
+        wxBell();
+    }
+    wire_target_ = WireTarget{};
     RefreshEditorViews();
 }
 
 void SchematicCanvas::OnMouseMove(wxMouseEvent& event) {
     last_mouse_model_ = ScreenToModel(event.GetPosition());
     if (dragging_component_ && event.LeftIsDown()) {
-        drag_preview_position_ = editor_.SnapToGrid(last_mouse_model_);
+        // 元件跟着鼠标走：把「按下点 → 当前位置」的位移加到原坐标上，再整体吸附网格。
+        const Point2D delta{last_mouse_model_.x - drag_press_model_.x,
+                            last_mouse_model_.y - drag_press_model_.y};
+        drag_preview_position_ = editor_.SnapToGrid(
+            {drag_origin_position_.x + delta.x, drag_origin_position_.y + delta.y});
+        SetCursor(wxCursor(wxCURSOR_SIZING));
         Refresh();
         return;
     }
@@ -220,7 +281,28 @@ void SchematicCanvas::OnMouseMove(wxMouseEvent& event) {
         Refresh();
         return;
     }
-    if (editor_.GetPendingWire().has_value()) {
+
+    const SchematicSnapshot snapshot = editor_.GetSnapshot();
+    bool needs_refresh = false;
+    if (editor_.GetToolMode() == ToolMode::kWire) {
+        const WireTarget target = ComputeWireTarget(last_mouse_model_, snapshot);
+        if (target.kind != wire_target_.kind ||
+            !SamePoint(target.position, wire_target_.position)) {
+            needs_refresh = true;
+        }
+        wire_target_ = target;
+        if (editor_.GetPendingWire().has_value()) {
+            needs_refresh = true;  // 橡皮筋跟着鼠标走
+        }
+    } else if (editor_.GetToolMode() == ToolMode::kSelect) {
+        const std::optional<ComponentId> hover = HitComponent(last_mouse_model_, snapshot);
+        if (hover != hover_component_id_) {
+            hover_component_id_ = hover;
+            needs_refresh = true;
+        }
+    }
+    UpdateHoverCursor(last_mouse_model_);
+    if (needs_refresh) {
         Refresh();
     }
 }
@@ -228,11 +310,18 @@ void SchematicCanvas::OnMouseMove(wxMouseEvent& event) {
 void SchematicCanvas::OnMouseRightDown(wxMouseEvent& event) {
     static_cast<void>(event);
     editor_.CancelWire();
-    dragging_component_ = false;
-    drag_preview_position_.reset();
-    if (HasCapture()) {
-        ReleaseMouse();
-    }
+    // 右键打断拖动：这次移动不提交，元件留在原处。
+    AbortComponentDrag();
+    wire_target_ = WireTarget{};
+    UpdateHoverCursor(last_mouse_model_);
+    RefreshEditorViews();
+}
+
+// 捕获被系统抢走（弹窗、切窗口等）时收不到 LEFT_UP，拖动状态会卡在半路：
+// 直接把这次拖动作废，元件留在原处。
+void SchematicCanvas::OnMouseCaptureLost(wxMouseCaptureLostEvent& event) {
+    static_cast<void>(event);
+    AbortComponentDrag();
     RefreshEditorViews();
 }
 
@@ -261,6 +350,25 @@ void SchematicCanvas::OnKeyDown(wxKeyEvent& event) {
         return;
     }
 
+    // 布线进行中：退格退掉最后一个拐点，回车以最后一个拐点收尾。
+    if (editor_.GetPendingWire().has_value()) {
+        if (event.GetKeyCode() == WXK_BACK) {
+            if (!editor_.RemoveLastWireBend()) {
+                editor_.CancelWire();
+            }
+            RefreshEditorViews();
+            return;
+        }
+        if (event.GetKeyCode() == WXK_RETURN) {
+            if (!editor_.FinishWireAtLastBend()) {
+                wxBell();
+            }
+            wire_target_ = WireTarget{};
+            RefreshEditorViews();
+            return;
+        }
+    }
+
     switch (event.GetKeyCode()) {
         case 'S':
             editor_.SetToolMode(ToolMode::kSelect);
@@ -274,6 +382,38 @@ void SchematicCanvas::OnKeyDown(wxKeyEvent& event) {
         case 'R':
             static_cast<void>(editor_.RotateSelected());
             break;
+        case WXK_LEFT:
+        case WXK_RIGHT:
+        case WXK_UP:
+        case WXK_DOWN: {
+            // 方向键微调选中元件：一次一格，导线跟着引脚走。
+            const SelectionState selection = editor_.GetSelection();
+            if (selection.component_ids.size() != 1) {
+                event.Skip();
+                return;
+            }
+            const std::optional<ComponentInstance> component =
+                editor_.GetComponent(selection.component_ids.front());
+            if (!component.has_value()) {
+                event.Skip();
+                return;
+            }
+            Point2D target = component->position;
+            if (event.GetKeyCode() == WXK_LEFT) {
+                target.x -= kDefaultGridSize;
+            } else if (event.GetKeyCode() == WXK_RIGHT) {
+                target.x += kDefaultGridSize;
+            } else if (event.GetKeyCode() == WXK_UP) {
+                target.y -= kDefaultGridSize;
+            } else {
+                target.y += kDefaultGridSize;
+            }
+            if (!editor_.MoveComponent(component->id, target)) {
+                event.Skip();
+                return;
+            }
+            break;
+        }
         case WXK_DELETE:
         case WXK_BACK:
             static_cast<void>(editor_.DeleteSelection());
@@ -324,7 +464,12 @@ Point2D SchematicCanvas::RotateRelative(Point2D relative, Rect2D bounds,
 }
 
 std::optional<ComponentId> SchematicCanvas::HitComponent(Point2D model_point) const {
-    const SchematicSnapshot snapshot = editor_.GetSnapshot();
+    return HitComponent(model_point, editor_.GetSnapshot());
+}
+
+// 从后往前找：绘制顺序是按 id 升序，命中测试反过来 —— 画在上面的先被选中。
+std::optional<ComponentId> SchematicCanvas::HitComponent(
+    Point2D model_point, const SchematicSnapshot& snapshot) const {
     for (auto iterator = snapshot.components.rbegin(); iterator != snapshot.components.rend();
          ++iterator) {
         const std::optional<ComponentDefinition> definition =
@@ -345,7 +490,11 @@ std::optional<ComponentId> SchematicCanvas::HitComponent(Point2D model_point) co
 }
 
 std::optional<SchematicCanvas::PinHit> SchematicCanvas::HitPin(Point2D model_point) const {
-    const SchematicSnapshot snapshot = editor_.GetSnapshot();
+    return HitPin(model_point, editor_.GetSnapshot());
+}
+
+std::optional<SchematicCanvas::PinHit> SchematicCanvas::HitPin(
+    Point2D model_point, const SchematicSnapshot& snapshot) const {
     const double hit_radius_squared = (kPinHitRadius / zoom_) * (kPinHitRadius / zoom_);
     for (auto component_iterator = snapshot.components.rbegin();
          component_iterator != snapshot.components.rend(); ++component_iterator) {
@@ -364,18 +513,21 @@ std::optional<SchematicCanvas::PinHit> SchematicCanvas::HitPin(Point2D model_poi
     return std::nullopt;
 }
 
+std::vector<Point2D> SchematicCanvas::WirePoints(const WireModel& wire,
+                                                 const SchematicSnapshot& snapshot) const {
+    // 端点解析 + 正交拐点（含自动避让、挪动后补拐点）：和建网用的是同一个函数，
+    // 画布上看到的折线就是建网时拿来判断连接的折线。
+    return model::WirePolyline(snapshot, library_, wire);
+}
+
 std::optional<WireId> SchematicCanvas::HitWire(Point2D model_point) const {
     const SchematicSnapshot snapshot = editor_.GetSnapshot();
-    const double hit_radius_squared = (6.0 / zoom_) * (6.0 / zoom_);
+    const double hit_radius_squared = (kWireHitRadius / zoom_) * (kWireHitRadius / zoom_);
     for (auto wire_iterator = snapshot.wires.rbegin(); wire_iterator != snapshot.wires.rend();
          ++wire_iterator) {
-        std::vector<Point2D> points;
-        points.push_back(ResolveEndpoint(wire_iterator->from));
-        points.insert(points.end(), wire_iterator->route_points.begin(),
-                      wire_iterator->route_points.end());
-        points.push_back(ResolveEndpoint(wire_iterator->to));
+        const std::vector<Point2D> points = WirePoints(*wire_iterator, snapshot);
         for (std::size_t index = 1; index < points.size(); ++index) {
-            if (DistanceToSegmentSquared(model_point, points[index - 1], points[index]) <=
+            if (model::DistanceToSegmentSquared(model_point, points[index - 1], points[index]) <=
                 hit_radius_squared) {
                 return wire_iterator->id;
             }
@@ -384,28 +536,47 @@ std::optional<WireId> SchematicCanvas::HitWire(Point2D model_point) const {
     return std::nullopt;
 }
 
-Point2D SchematicCanvas::ResolveEndpoint(const WireEndpoint& endpoint) const {
-    if (!endpoint.pin.has_value()) {
-        return endpoint.position;
+// 既有导线上离光标最近的投影点：把新导线接到导线中段（T 形相接）时用。
+std::optional<Point2D> SchematicCanvas::HitWirePoint(Point2D model_point,
+                                                     const SchematicSnapshot& snapshot) const {
+    const double hit_radius_squared = (kWireHitRadius / zoom_) * (kWireHitRadius / zoom_);
+    std::optional<Point2D> closest;
+    double closest_distance_squared = hit_radius_squared;
+    for (const WireModel& wire : snapshot.wires) {
+        const std::vector<Point2D> points = WirePoints(wire, snapshot);
+        for (std::size_t index = 1; index < points.size(); ++index) {
+            const double distance_squared =
+                model::DistanceToSegmentSquared(model_point, points[index - 1], points[index]);
+            if (distance_squared <= closest_distance_squared) {
+                closest_distance_squared = distance_squared;
+                closest = model::ClosestPointOnSegment(model_point, points[index - 1],
+                                                       points[index]);
+            }
+        }
     }
-    const std::optional<ComponentInstance> component =
-        editor_.GetComponent(endpoint.pin->component_id);
-    if (!component.has_value()) {
-        return endpoint.position;
+    return closest;
+}
+
+// 连线落点：引脚 > 既有导线 > 空白（空白按网格吸附）。
+SchematicCanvas::WireTarget SchematicCanvas::ComputeWireTarget(
+    Point2D model_point, const SchematicSnapshot& snapshot) const {
+    WireTarget target;
+    const std::optional<PinHit> pin_hit = HitPin(model_point, snapshot);
+    if (pin_hit.has_value()) {
+        target.kind = WireTarget::Kind::kPin;
+        target.pin = pin_hit->pin;
+        target.position = pin_hit->position;  // 精确落在引脚上，而不是鼠标位置
+        return target;
     }
-    const std::optional<ComponentDefinition> definition =
-        library_.FindByTypeId(component->type_id);
-    if (!definition.has_value()) {
-        return endpoint.position;
+    const std::optional<Point2D> wire_point = HitWirePoint(model_point, snapshot);
+    if (wire_point.has_value()) {
+        target.kind = WireTarget::Kind::kWire;
+        target.position = *wire_point;
+        return target;
     }
-    const auto pin_iterator = std::find_if(
-        definition->pins.begin(), definition->pins.end(), [endpoint](const PinDefinition& pin) {
-            return pin.local_id == endpoint.pin->pin_id;
-        });
-    if (pin_iterator == definition->pins.end()) {
-        return endpoint.position;
-    }
-    return GetPinPosition(*component, *definition, *pin_iterator);
+    target.kind = WireTarget::Kind::kEmpty;
+    target.position = editor_.SnapToGrid(model_point);
+    return target;
 }
 
 bool SchematicCanvas::IsComponentSelected(ComponentId component_id) const {
@@ -418,6 +589,113 @@ bool SchematicCanvas::IsWireSelected(WireId wire_id) const {
     const SelectionState selection = editor_.GetSelection();
     return std::find(selection.wire_ids.begin(), selection.wire_ids.end(), wire_id) !=
            selection.wire_ids.end();
+}
+
+// ---- 元件拖动：拖动过程中只改预览坐标，松手才落一条 MoveComponent 命令 ----
+
+bool SchematicCanvas::HasDragPreview() const {
+    return dragging_component_ && drag_preview_position_.has_value() &&
+           !SamePoint(*drag_preview_position_, drag_origin_position_);
+}
+
+void SchematicCanvas::BeginComponentDrag(ComponentId component_id, Point2D press_model) {
+    const std::optional<ComponentInstance> component = editor_.GetComponent(component_id);
+    if (!component.has_value()) {
+        return;
+    }
+    dragging_component_ = true;
+    dragging_component_id_ = component_id;
+    drag_origin_position_ = component->position;
+    drag_press_model_ = press_model;
+    drag_preview_position_ = component->position;
+}
+
+void SchematicCanvas::EndComponentDrag() {
+    if (HasDragPreview()) {
+        static_cast<void>(editor_.MoveComponent(dragging_component_id_, *drag_preview_position_));
+    }
+    dragging_component_ = false;
+    dragging_component_id_ = kInvalidComponentId;
+    drag_preview_position_.reset();
+}
+
+void SchematicCanvas::AbortComponentDrag() {
+    // 只有真在拖元件时才放掉捕获：中键平移也持有捕获，右键不该打断它。
+    const bool was_dragging = dragging_component_;
+    dragging_component_ = false;
+    dragging_component_id_ = kInvalidComponentId;
+    drag_preview_position_.reset();
+    if (was_dragging && HasCapture()) {
+        ReleaseMouse();
+    }
+}
+
+// 拖着元件画的时候，用预览坐标替换模型坐标：挂在它引脚上的导线会一起走。
+void SchematicCanvas::ApplyDragPreview(SchematicSnapshot& snapshot) const {
+    if (!HasDragPreview()) {
+        return;
+    }
+    for (ComponentInstance& component : snapshot.components) {
+        if (component.id == dragging_component_id_) {
+            component.position = *drag_preview_position_;
+            return;
+        }
+    }
+}
+
+// 布线途中落一次点：空白处落点当拐点接着画；落到引脚/导线上就收尾。
+void SchematicCanvas::CommitWireSegment(const WireTarget& target) {
+    const std::optional<editor::PendingWire> pending_wire = editor_.GetPendingWire();
+    if (!pending_wire.has_value() || target.kind == WireTarget::Kind::kNone) {
+        return;
+    }
+    const std::vector<Point2D> path = PlanSegmentTo(*pending_wire, target);
+
+    if (target.kind == WireTarget::Kind::kEmpty) {
+        for (Point2D point : path) {
+            static_cast<void>(editor_.AddWireBend(point));
+        }
+        return;
+    }
+
+    // 落到引脚/导线上：先把途中的直角拐点补齐，再收尾。
+    // 收尾失败（比如点回起始引脚）就把刚补的拐点退回去，
+    // 别让一次失败的点击悄悄改掉正在画的折线。
+    const std::size_t bend_count_before = pending_wire->route_points.size();
+    for (std::size_t index = 0; index + 1 < path.size(); ++index) {
+        static_cast<void>(editor_.AddWireBend(path[index]));
+    }
+    const bool completed = target.kind == WireTarget::Kind::kPin
+                               ? editor_.CompleteWire(target.pin, target.position)
+                               : editor_.CompleteWireAtPoint(target.position);
+    if (!completed) {
+        std::optional<editor::PendingWire> pending = editor_.GetPendingWire();
+        while (pending.has_value() && pending->route_points.size() > bend_count_before) {
+            static_cast<void>(editor_.RemoveLastWireBend());
+            pending = editor_.GetPendingWire();
+        }
+        wxBell();
+    }
+}
+
+void SchematicCanvas::UpdateHoverCursor(Point2D model_point) {
+    if (dragging_component_) {
+        SetCursor(wxCursor(wxCURSOR_SIZING));
+        return;
+    }
+    switch (editor_.GetToolMode()) {
+        case ToolMode::kWire:
+        case ToolMode::kPlaceComponent:
+            SetCursor(wxCursor(wxCURSOR_CROSS));
+            return;
+        case ToolMode::kPan:
+            SetCursor(wxCursor(wxCURSOR_HAND));
+            return;
+        case ToolMode::kSelect:
+            break;
+    }
+    SetCursor(HitComponent(model_point).has_value() ? wxCursor(wxCURSOR_SIZING)
+                                                    : wxCursor(wxCURSOR_ARROW));
 }
 
 void SchematicCanvas::DrawGrid(wxDC& dc) {
@@ -472,18 +750,22 @@ void SchematicCanvas::DrawWires(wxDC& dc, const SchematicSnapshot& snapshot) {
             colour = wxColour(40, 115, 150);
         }
         dc.SetPen(wxPen(colour, width));
-        std::vector<Point2D> points;
-        points.push_back(ResolveEndpoint(wire.from));
-        points.insert(points.end(), wire.route_points.begin(), wire.route_points.end());
-        points.push_back(ResolveEndpoint(wire.to));
+        const std::vector<Point2D> points = WirePoints(wire, snapshot);
         for (std::size_t index = 1; index < points.size(); ++index) {
             dc.DrawLine(ModelToScreen(points[index - 1]), ModelToScreen(points[index]));
         }
+        // 拐点上点一个小圆点，折线在哪里转弯一眼能看出来。
+        if (!wire.route_points.empty()) {
+            dc.SetPen(wxPen(colour, 1));
+            dc.SetBrush(wxBrush(colour));
+            const int radius = std::max(2, static_cast<int>(std::lround(2.0 * zoom_)));
+            for (const Point2D& bend : wire.route_points) {
+                dc.DrawCircle(ModelToScreen(bend), radius);
+            }
+        }
         // 悬空导线（没接入任何网络）在仿真态画个小问号提示。
         if (simulation_.has_value() && !value.has_value()) {
-            const Point2D middle{(points.front().x + points.back().x) / 2.0,
-                                 (points.front().y + points.back().y) / 2.0};
-            dc.DrawText(L"?", ModelToScreen(middle));
+            dc.DrawText(L"?", ModelToScreen(PolylineMidPoint(points)));
         }
     }
 }
@@ -499,6 +781,15 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
         const int width = static_cast<int>(std::lround(definition->default_bounds.width * zoom_));
         const int height = static_cast<int>(std::lround(definition->default_bounds.height * zoom_));
         const bool selected = IsComponentSelected(component.id);
+        // 悬停提示：鼠标底下的元件加一圈虚线，点下去抓的就是它。
+        const bool hovered = !selected && !dragging_component_ &&
+                             hover_component_id_.has_value() &&
+                             *hover_component_id_ == component.id;
+        if (hovered) {
+            dc.SetPen(wxPen(wxColour(120, 170, 220), 1, wxPENSTYLE_DOT));
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.DrawRectangle(top_left.x - 3, top_left.y - 3, width + 6, height + 6);
+        }
         dc.SetPen(wxPen(selected ? wxColour(210, 75, 60) : wxColour(55, 65, 80),
                         selected ? 3 : 2));
         if (component.type_id == "io.input") {
@@ -615,13 +906,81 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
     }
 }
 
+// 拖动中的元件原位留一个虚线框，方便看清「从哪拖到哪」。
+void SchematicCanvas::DrawDragOriginMarker(wxDC& dc, const SchematicSnapshot& snapshot) {
+    if (!HasDragPreview()) {
+        return;
+    }
+    for (const ComponentInstance& component : snapshot.components) {
+        if (component.id != dragging_component_id_) {
+            continue;
+        }
+        const std::optional<ComponentDefinition> definition =
+            library_.FindByTypeId(component.type_id);
+        if (!definition.has_value()) {
+            return;
+        }
+        const wxPoint origin = ModelToScreen(drag_origin_position_);
+        const int width = static_cast<int>(std::lround(definition->default_bounds.width * zoom_));
+        const int height = static_cast<int>(std::lround(definition->default_bounds.height * zoom_));
+        dc.SetPen(wxPen(wxColour(150, 158, 170), 1, wxPENSTYLE_DOT));
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle(origin.x, origin.y, width, height);
+        return;
+    }
+}
+
+// 待画折线到 target 这一跳的正交路径（含自动避让）。
+// 提交和预览走同一个函数，虚线预览就是松手后的形状。
+std::vector<Point2D> SchematicCanvas::PlanSegmentTo(const editor::PendingWire& pending_wire,
+                                                    const WireTarget& target) const {
+    return model::PlanWireSegment(editor_.GetSnapshot(), library_, WireAnchorPoint(pending_wire),
+                                  target.position, WireAnchorPin(pending_wire),
+                                  target.kind == WireTarget::Kind::kPin
+                                      ? std::optional<PinRef>(target.pin)
+                                      : std::optional<PinRef>());
+}
+
+// 布线预览：已定的折线段 + 到鼠标落点的橡皮筋。
 void SchematicCanvas::DrawTemporaryWire(wxDC& dc) {
     const std::optional<editor::PendingWire> pending_wire = editor_.GetPendingWire();
     if (!pending_wire.has_value()) {
         return;
     }
+    std::vector<Point2D> points;
+    points.push_back(pending_wire->start_position);
+    points.insert(points.end(), pending_wire->route_points.begin(),
+                  pending_wire->route_points.end());
+    if (wire_target_.kind != WireTarget::Kind::kNone) {
+        const std::vector<Point2D> path = PlanSegmentTo(*pending_wire, wire_target_);
+        points.insert(points.end(), path.begin(), path.end());
+    }
+
     dc.SetPen(wxPen(wxColour(110, 110, 110), 2, wxPENSTYLE_DOT));
-    dc.DrawLine(ModelToScreen(pending_wire->start_position), ModelToScreen(last_mouse_model_));
+    dc.SetBrush(*wxTRANSPARENT_BRUSH);
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        dc.DrawLine(ModelToScreen(points[index - 1]), ModelToScreen(points[index]));
+    }
+
+    // 已定的拐点画小方块，起点画个圈；落点吸到引脚/导线上时再给个提示。
+    const int marker = std::max(2, static_cast<int>(std::lround(2.0 * zoom_)));
+    dc.SetPen(wxPen(wxColour(110, 110, 110), 1));
+    dc.SetBrush(wxBrush(wxColour(110, 110, 110)));
+    for (std::size_t index = 1; index <= pending_wire->route_points.size(); ++index) {
+        const wxPoint screen = ModelToScreen(points[index]);
+        dc.DrawRectangle(screen.x - marker, screen.y - marker, marker * 2, marker * 2);
+    }
+    dc.SetBrush(*wxTRANSPARENT_BRUSH);
+    dc.SetPen(wxPen(wxColour(110, 110, 110), 1));
+    dc.DrawCircle(ModelToScreen(pending_wire->start_position), marker * 2);
+    if (wire_target_.kind == WireTarget::Kind::kPin) {
+        dc.SetPen(wxPen(wxColour(210, 75, 60), 2));
+        dc.DrawCircle(ModelToScreen(wire_target_.position), marker * 3);
+    } else if (wire_target_.kind == WireTarget::Kind::kWire) {
+        dc.SetPen(wxPen(wxColour(210, 75, 60), 1));
+        dc.SetBrush(wxBrush(wxColour(210, 75, 60)));
+        dc.DrawCircle(ModelToScreen(wire_target_.position), marker);
+    }
 }
 
 void SchematicCanvas::RefreshEditorViews() {

@@ -1,14 +1,13 @@
 #include "src/model/net_builder.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <map>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
 
 #include "contracts/ids.hpp"
+#include "src/model/wire_route.hpp"
 
 namespace cse::model {
 
@@ -17,47 +16,6 @@ namespace {
     // 端点吸附容差：画布上网格 10px、端点都落在网格上，0.5 足以吸收浮点误差，
     // 又不会把相邻网格上的两个点误接到一起。
     constexpr double kJoinEpsilon = 0.5;
-
-    int NormalizeQuarterTurn(double rotation_deg) {
-        int quarter_turn = static_cast<int>(std::lround(rotation_deg / 90.0)) % 4;
-        if (quarter_turn < 0) {
-            quarter_turn += 4;
-        }
-        return quarter_turn;
-    }
-
-    // 与画布同一套引脚旋转公式，保证建网用的坐标和显示一致。
-    Point2D RotateRelative(Point2D relative, Rect2D bounds, double rotation_deg) {
-        const Point2D center{bounds.width / 2.0, bounds.height / 2.0};
-        const double local_x = relative.x - center.x;
-        const double local_y = relative.y - center.y;
-        switch (NormalizeQuarterTurn(rotation_deg)) {
-            case 1:
-                return {center.x - local_y, center.y + local_x};
-            case 2:
-                return {center.x - local_x, center.y - local_y};
-            case 3:
-                return {center.x + local_y, center.y - local_x};
-            default:
-                return relative;
-        }
-    }
-
-    double DistanceToSegmentSquared(Point2D point, Point2D start, Point2D end) {
-        const double dx = end.x - start.x;
-        const double dy = end.y - start.y;
-        const double length_squared = dx * dx + dy * dy;
-        if (length_squared <= std::numeric_limits<double>::epsilon()) {
-            const double ex = point.x - start.x;
-            const double ey = point.y - start.y;
-            return ex * ex + ey * ey;
-        }
-        const double parameter = std::clamp(
-            ((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared, 0.0, 1.0);
-        const double px = start.x + parameter * dx - point.x;
-        const double py = start.y + parameter * dy - point.y;
-        return px * px + py * py;
-    }
 
     // 并查集：把"接到一起"的导线/引脚并成同一个连通分量。
     class DisjointSet {
@@ -111,8 +69,7 @@ namespace {
 }  // namespace
 
 BuiltNetlist BuildNets(const SchematicSnapshot& snapshot, const IComponentLibrary& library) {
-    // 1. 解析每个引脚的绝对坐标（含旋转），缓存元件定义和位号供命名用。
-    std::unordered_map<std::uint64_t, Point2D> pin_positions;
+    // 1. 缓存元件定义和位号，供网络命名用。
     std::unordered_map<ComponentId, ComponentDefinition> definitions;
     std::unordered_map<ComponentId, std::string> references;
     for (const ComponentInstance& component : snapshot.components) {
@@ -122,14 +79,6 @@ BuiltNetlist BuildNets(const SchematicSnapshot& snapshot, const IComponentLibrar
             continue;
         }
         references.emplace(component.id, component.reference);
-        for (const PinDefinition& pin : definition->pins) {
-            const Point2D rotated =
-                RotateRelative(pin.relative_position, definition->default_bounds,
-                               component.rotation_deg);
-            pin_positions.emplace(PinKey(component.id, pin.local_id),
-                                  Point2D{component.position.x + rotated.x,
-                                          component.position.y + rotated.y});
-        }
         definitions.emplace(component.id, *definition);
     }
 
@@ -169,22 +118,10 @@ BuiltNetlist BuildNets(const SchematicSnapshot& snapshot, const IComponentLibrar
     }
 
     // 4. 几何合并：端点重合 / T 形相接。先把每条导线的折线算出来（挂引脚的
-    //    端点用引脚绝对坐标），再做端点-线段距离测试。
-    auto resolve_position = [&pin_positions](const WireEndpoint& endpoint) {
-        if (!endpoint.pin.has_value()) {
-            return endpoint.position;
-        }
-        const auto iterator = pin_positions.find(PinKey(endpoint.pin->component_id,
-                                                        endpoint.pin->pin_id));
-        return iterator != pin_positions.end() ? iterator->second : endpoint.position;
-    };
+    //    端点用引脚绝对坐标，中间拐点走和画布同一套正交规划），再做端点-线段距离测试。
     std::vector<std::vector<Point2D>> polylines(wire_count);
     for (std::size_t index = 0; index < wire_count; ++index) {
-        const WireModel& wire = snapshot.wires[index];
-        polylines[index].push_back(resolve_position(wire.from));
-        polylines[index].insert(polylines[index].end(), wire.route_points.begin(),
-                                wire.route_points.end());
-        polylines[index].push_back(resolve_position(wire.to));
+        polylines[index] = WirePolyline(snapshot, library, snapshot.wires[index]);
     }
 
     const double epsilon_squared = kJoinEpsilon * kJoinEpsilon;

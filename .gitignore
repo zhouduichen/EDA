@@ -1,4 +1,8 @@
 build/
+build-release/
 work/
 outputs/
 .DS_Store
+package/
+CZW/
+*.zip

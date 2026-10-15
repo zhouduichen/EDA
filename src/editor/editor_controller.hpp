@@ -20,6 +20,8 @@ namespace cse::editor {
 struct PendingWire {
     PinRef start_pin;
     Point2D start_position;
+    // 画到一半时已经定下的拐点（坐标为画布吸附后的最终坐标，不再二次吸附）。
+    std::vector<Point2D> route_points;
 };
 
 class EditorController final : public IEditorQuery {
@@ -44,6 +46,14 @@ public:
 
     bool BeginWire(PinRef pin, Point2D position);
     bool CompleteWire(PinRef pin, Point2D position);
+    // 终点落在空白处或既有导线上（T 形相接）：position 由画布决定是否吸附。
+    bool CompleteWireAtPoint(Point2D position);
+    // 布线途中追加一个拐点。
+    bool AddWireBend(Point2D position);
+    // 退掉最后一个拐点（Backspace）。
+    bool RemoveLastWireBend();
+    // 在最后一个拐点收尾（回车），省掉「最后再点一下」。
+    bool FinishWireAtLastBend();
     void CancelWire();
     std::optional<PendingWire> GetPendingWire() const;
 
@@ -63,6 +73,7 @@ public:
 
 private:
     bool IsValidPin(PinRef pin) const;
+    bool FinishPendingWire(std::optional<PinRef> end_pin, Point2D position);
     bool ExecuteCommand(std::unique_ptr<ICommand> command);
     void NotifyModelChanged();
     void NotifySelectionChanged();

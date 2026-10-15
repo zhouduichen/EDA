@@ -8,6 +8,23 @@
 
 namespace cse::editor {
 
+namespace {
+
+constexpr double kPointEpsilon = 0.000001;
+
+bool SamePoint(Point2D first, Point2D second) {
+    return std::abs(first.x - second.x) < kPointEpsilon &&
+           std::abs(first.y - second.y) < kPointEpsilon;
+}
+
+// 当前正在画的那一段的起点：有拐点就是最后一个拐点，否则是最初按下的引脚。
+Point2D WireAnchor(const PendingWire& pending_wire) {
+    return pending_wire.route_points.empty() ? pending_wire.start_position
+                                             : pending_wire.route_points.back();
+}
+
+}  // namespace
+
 EditorController::EditorController(model::SchematicModel& model, const IComponentLibrary& library,
                                    IComponentFactory& factory)
     : model_(model), library_(library), factory_(factory) {}
@@ -26,6 +43,9 @@ ToolMode EditorController::GetToolMode() const {
 void EditorController::SetPlacementType(std::string type_id) {
     placement_type_ = std::move(type_id);
     tool_mode_ = ToolMode::kPlaceComponent;
+    // 模式切走时和 SetToolMode 一样清掉画到一半的线，不然草稿静默存活，
+    // 回到连线模式时旧橡皮筋凭空复活。
+    pending_wire_.reset();
 }
 
 const std::string& EditorController::GetPlacementType() const {
@@ -139,6 +159,12 @@ bool EditorController::DeleteSelection() {
         }
     }
 
+    // 选区里可能全是已经不存在的 id（比如撤销后留下的死引用）：
+    // 过滤后没东西可删就别把空命令推进撤销栈污染历史。
+    if (components.empty() && wires.empty()) {
+        return false;
+    }
+
     if (!ExecuteCommand(std::make_unique<DeleteSelectionCommand>(
             NextCommandId(), model_, std::move(components), std::move(wires)))) {
         return false;
@@ -154,7 +180,26 @@ bool EditorController::BeginWire(PinRef pin, Point2D position) {
     if (tool_mode_ != ToolMode::kWire || !IsValidPin(pin)) {
         return false;
     }
-    pending_wire_ = PendingWire{pin, position};
+    PendingWire pending_wire;
+    pending_wire.start_pin = pin;
+    pending_wire.start_position = position;
+    pending_wire_ = std::move(pending_wire);
+    return true;
+}
+
+bool EditorController::AddWireBend(Point2D position) {
+    if (!pending_wire_.has_value() || SamePoint(WireAnchor(*pending_wire_), position)) {
+        return false;
+    }
+    pending_wire_->route_points.push_back(position);
+    return true;
+}
+
+bool EditorController::RemoveLastWireBend() {
+    if (!pending_wire_.has_value() || pending_wire_->route_points.empty()) {
+        return false;
+    }
+    pending_wire_->route_points.pop_back();
     return true;
 }
 
@@ -164,12 +209,51 @@ bool EditorController::CompleteWire(PinRef pin, Point2D position) {
          pending_wire_->start_pin.pin_id == pin.pin_id)) {
         return false;
     }
+    return FinishPendingWire(pin, position);
+}
+
+bool EditorController::CompleteWireAtPoint(Point2D position) {
+    return FinishPendingWire(std::nullopt, position);
+}
+
+bool EditorController::FinishWireAtLastBend() {
+    if (!pending_wire_.has_value() || pending_wire_->route_points.empty()) {
+        return false;
+    }
+    const Point2D last_bend = pending_wire_->route_points.back();
+    pending_wire_->route_points.pop_back();
+    return FinishPendingWire(std::nullopt, last_bend);
+}
+
+// 收尾：把开始引脚、已定拐点、终点组装成一条导线，中间不产生零长度段。
+bool EditorController::FinishPendingWire(std::optional<PinRef> end_pin, Point2D position) {
+    if (!pending_wire_.has_value()) {
+        return false;
+    }
+
+    std::vector<Point2D> route_points;
+    Point2D previous = pending_wire_->start_position;
+    for (Point2D bend : pending_wire_->route_points) {
+        if (SamePoint(previous, bend)) {
+            continue;
+        }
+        route_points.push_back(bend);
+        previous = bend;
+    }
+    // 终点正好落在最后一个拐点上时，这个拐点直接升级成终点。
+    while (!route_points.empty() && SamePoint(route_points.back(), position)) {
+        route_points.pop_back();
+    }
+    if (route_points.empty() && SamePoint(pending_wire_->start_position, position)) {
+        return false;  // 退化成零长度导线
+    }
 
     WireModel wire;
     wire.from.pin = pending_wire_->start_pin;
     wire.from.position = pending_wire_->start_position;
-    wire.to.pin = pin;
+    wire.to.pin = end_pin;
     wire.to.position = position;
+    wire.route_points = std::move(route_points);
 
     const bool executed = ExecuteCommand(
         std::make_unique<AddWireCommand>(NextCommandId(), model_, std::move(wire)));
@@ -198,6 +282,9 @@ bool EditorController::Undo() {
     if (undo_stack_.empty()) {
         return false;
     }
+    // 撤销改了模型，正在画的线可能挂在刚被撤掉的元件上——
+    // 不取消的话半成品虚线会一直悬在画布上，只能靠 Esc 清掉。
+    pending_wire_.reset();
     std::unique_ptr<ICommand> command = std::move(undo_stack_.back());
     undo_stack_.pop_back();
     command->Undo();
@@ -210,6 +297,8 @@ bool EditorController::Redo() {
     if (redo_stack_.empty()) {
         return false;
     }
+    // 理由同 Undo：模型要变，画到一半的线一并取消。
+    pending_wire_.reset();
     std::unique_ptr<ICommand> command = std::move(redo_stack_.back());
     redo_stack_.pop_back();
     if (!command->Execute()) {

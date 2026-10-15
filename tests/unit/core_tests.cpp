@@ -2,9 +2,11 @@
 // 测试文件必须取消 NDEBUG，让断言在任何配置下都真正执行。
 #undef NDEBUG
 #include <cassert>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include <unordered_map>
 
@@ -15,6 +17,7 @@
 #include "src/editor/editor_controller.hpp"
 #include "src/model/net_builder.hpp"
 #include "src/model/schematic_model.hpp"
+#include "src/model/wire_route.hpp"
 #include "src/sim/logic_simulator.hpp"
 
 namespace {
@@ -235,6 +238,275 @@ namespace {
         assert(defaulted.pin_values.at(cse::PinKey(3, 1)) == cse::LogicValue::kLow);
     }
 
+    // 走线必须只走水平/垂直；而且自动拐点不能正好压在别的引脚上——
+    // 半加器里 AND 就摆在 XOR 正下方，拐点随手取 (to.x, from.y) 的话
+    // 会正好压在 AND.A 上，把 A、B 两条支路并成一个网络。
+    void TestWireRouteIsOrthogonalAndKeepsNetsApart() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        // 与演示工程 demo_half_adder.cseproj 同一套坐标
+        snapshot.components.push_back(MakeComponent(1, "io.input", "IN1", 0.0, 0.0));
+        snapshot.components.push_back(MakeComponent(2, "io.input", "IN2", 0.0, 100.0));
+        snapshot.components.push_back(MakeComponent(3, "logic.xor", "X1", 200.0, 0.0));
+        snapshot.components.push_back(MakeComponent(4, "logic.and", "U1", 200.0, 100.0));
+        snapshot.components.push_back(MakeComponent(5, "io.output", "OUT1", 350.0, 10.0));
+        snapshot.components.push_back(MakeComponent(6, "io.output", "OUT2", 350.0, 110.0));
+
+        snapshot.wires.push_back(MakeWire(1, 1, 1, { 50.0, 15.0 }, 3, 1, { 200.0, 15.0 }));
+        snapshot.wires.push_back(MakeWire(2, 2, 1, { 50.0, 115.0 }, 3, 2, { 200.0, 35.0 }));
+        snapshot.wires.push_back(MakeWire(3, 3, 3, { 270.0, 25.0 }, 5, 1, { 350.0, 25.0 }));
+        snapshot.wires.push_back(MakeWire(4, 1, 1, { 50.0, 15.0 }, 4, 1, { 200.0, 115.0 }));
+        snapshot.wires.push_back(MakeWire(5, 2, 1, { 50.0, 115.0 }, 4, 2, { 200.0, 135.0 }));
+        snapshot.wires.push_back(MakeWire(6, 4, 3, { 270.0, 125.0 }, 6, 1, { 350.0, 125.0 }));
+
+        for (const cse::WireModel& wire : snapshot.wires) {
+            const std::vector<cse::Point2D> points =
+                cse::model::WirePolyline(snapshot, library, wire);
+            assert(points.size() >= 2);
+            for (std::size_t index = 1; index < points.size(); ++index) {
+                const bool horizontal =
+                    std::abs(points[index].y - points[index - 1].y) < 0.5;
+                const bool vertical = std::abs(points[index].x - points[index - 1].x) < 0.5;
+                assert(horizontal || vertical);   // 不允许出现斜线段
+            }
+        }
+
+        // 半加器是 4 个独立网络（IN1 支路 / IN2 支路 / 和 / 进位），拐点压在 AND.A 上就会并成 2 个
+        const cse::model::BuiltNetlist netlist = cse::model::BuildNets(snapshot, library);
+        assert(netlist.nets.size() == 4);
+        assert(netlist.nets[0].name == "Net-(IN1-OUT)");
+        assert(netlist.nets[0].pins.size() == 3);   // IN1.OUT + X1.A + U1.A
+        assert(netlist.nets[1].name == "Net-(IN2-OUT)");
+        assert(netlist.nets[1].pins.size() == 3);   // IN2.OUT + X1.B + U1.B
+    }
+
+    // 交互布线的一跳：空图上和纯几何一致（横向偏移大先横后竖），
+    // 有障碍时自动拐点必须绕开别的引脚。
+    void TestPlanWireSegment() {
+        cse::component::ComponentLibrary library;
+        const cse::SchematicSnapshot empty;
+        const std::optional<cse::PinRef> no_pin;
+
+        // 横向偏移更大 → 先横后竖
+        const std::vector<cse::Point2D> horizontal_first = cse::model::PlanWireSegment(
+            empty, library, {0.0, 0.0}, {100.0, 40.0}, no_pin, no_pin);
+        assert(horizontal_first.size() == 2);
+        assert(horizontal_first[0].x == 100.0 && horizontal_first[0].y == 0.0);
+        assert(horizontal_first[1].x == 100.0 && horizontal_first[1].y == 40.0);
+
+        // 纵向偏移更大 → 先竖后横
+        const std::vector<cse::Point2D> vertical_first = cse::model::PlanWireSegment(
+            empty, library, {0.0, 0.0}, {40.0, 100.0}, no_pin, no_pin);
+        assert(vertical_first.size() == 2);
+        assert(vertical_first[0].x == 0.0 && vertical_first[0].y == 100.0);
+        assert(vertical_first[1].x == 40.0 && vertical_first[1].y == 100.0);
+
+        // 同一行/同一列：本来就不用拐
+        const std::vector<cse::Point2D> straight =
+            cse::model::PlanWireSegment(empty, library, {0.0, 0.0}, {80.0, 0.0}, no_pin, no_pin);
+        assert(straight.size() == 1);
+        assert(straight[0].x == 80.0 && straight[0].y == 0.0);
+
+        // 鼠标没挪动 → 没有路径点
+        assert(cse::model::PlanWireSegment(empty, library, {10.0, 10.0}, {10.0, 10.0}, no_pin,
+                                           no_pin)
+                   .empty());
+
+        // 障碍避让：横向优先的拐点 (200,0) 正好压在别处一个引脚上 → 换先竖后横
+        cse::SchematicSnapshot snapshot;
+        snapshot.components.push_back(MakeComponent(1, "io.output", "OUT1", 200.0, -15.0)); // IN (200,0)
+        const std::vector<cse::Point2D> avoided = cse::model::PlanWireSegment(
+            snapshot, library, {0.0, 0.0}, {200.0, 100.0}, no_pin, no_pin);
+        assert(avoided.size() == 2);
+        assert(avoided[0].x == 0.0 && avoided[0].y == 100.0);
+        assert(avoided[1].x == 200.0 && avoided[1].y == 100.0);
+    }
+
+    void TestEditorWireWithBends() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId input_id = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("io.output");
+        assert(editor.PlaceComponent({300.0, 100.0}));
+        const cse::ComponentId output_id = editor.GetSelection().component_ids.front();
+
+        // 带两个拐点接过去
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.AddWireBend({150.0, 15.0}));
+        assert(editor.AddWireBend({150.0, 115.0}));
+        assert(editor.AddWireBend({150.0, 115.0}) == false);  // 和上一个拐点重合，不加
+        assert(editor.GetPendingWire().has_value());
+        assert(editor.GetPendingWire()->route_points.size() == 2);
+        assert(editor.RemoveLastWireBend());
+        assert(editor.GetPendingWire()->route_points.size() == 1);
+        assert(editor.AddWireBend({150.0, 115.0}));
+        assert(editor.CompleteWire({output_id, 1}, {300.0, 115.0}));
+        assert(!editor.GetPendingWire().has_value());
+
+        const cse::SchematicSnapshot snapshot = editor.GetSnapshot();
+        assert(snapshot.wires.size() == 1);
+        assert(snapshot.wires[0].route_points.size() == 2);
+        assert(snapshot.wires[0].route_points[0].x == 150.0);
+        assert(snapshot.wires[0].route_points[0].y == 15.0);
+        assert(snapshot.wires[0].route_points[1].x == 150.0);
+        assert(snapshot.wires[0].route_points[1].y == 115.0);
+        assert(snapshot.wires[0].to.pin.has_value());
+        assert(snapshot.wires[0].to.pin->component_id == output_id);
+
+        // 整条折线是一条撤销命令，重做后拐点原样回来
+        assert(editor.Undo());
+        assert(editor.GetSnapshot().wires.empty());
+        assert(editor.Redo());
+        assert(editor.GetSnapshot().wires.size() == 1);
+        assert(editor.GetSnapshot().wires[0].route_points.size() == 2);
+
+        // 终点落在最后一个拐点上 → 拐点升级成终点，不产生零长度段
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({output_id, 1}, {300.0, 115.0}));
+        assert(editor.AddWireBend({250.0, 115.0}));
+        assert(editor.CompleteWireAtPoint({250.0, 115.0}));
+        const cse::SchematicSnapshot second = editor.GetSnapshot();
+        assert(second.wires.size() == 2);
+        assert(second.wires[1].route_points.empty());
+        assert(!second.wires[1].to.pin.has_value());
+        assert(second.wires[1].to.position.x == 250.0);
+        assert(second.wires[1].to.position.y == 115.0);
+
+        // 回车以最后一个拐点收尾
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({output_id, 1}, {300.0, 115.0}));
+        assert(editor.AddWireBend({280.0, 60.0}));
+        assert(editor.AddWireBend({200.0, 60.0}));
+        assert(editor.FinishWireAtLastBend());
+        const cse::SchematicSnapshot third = editor.GetSnapshot();
+        assert(third.wires.size() == 3);
+        assert(third.wires[2].route_points.size() == 1);
+        assert(third.wires[2].route_points[0].x == 280.0);
+        assert(third.wires[2].route_points[0].y == 60.0);
+        assert(third.wires[2].to.position.x == 200.0);
+        assert(third.wires[2].to.position.y == 60.0);
+
+        // 只有拐点的空折线、以及起止重合的退化导线都不生成
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.FinishWireAtLastBend() == false);
+        assert(editor.CompleteWireAtPoint({50.0, 15.0}) == false);
+        editor.CancelWire();
+        assert(editor.GetSnapshot().wires.size() == 3);
+
+        // 撤销会一并取消正在画的线：不然半成品线挂在刚被撤掉的元件上，
+        // 画布上只能靠 Esc 才清得掉
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.AddWireBend({150.0, 15.0}));
+        assert(editor.Undo());
+        assert(!editor.GetPendingWire().has_value());
+        assert(editor.GetSnapshot().wires.size() == 2);
+    }
+
+    // 拐点随导线一起存盘（CSEPROJ 2 的 ROUTE 段），老格式照常能打开。
+    void TestProjectRoutePointPersistence() {
+        cse::SchematicSnapshot snapshot;
+        cse::WireModel wire;
+        wire.id = 3;
+        wire.from.pin = cse::PinRef{1, 1};
+        wire.from.position = {50.0, 15.0};
+        wire.to.position = {300.0, 115.0};
+        wire.route_points = {{150.0, 15.0}, {150.0, 115.0}};
+        snapshot.wires.push_back(wire);
+
+        const std::string path = "cse_test_route_points.cseproj";
+        assert(cse::io::SaveProject(snapshot, path).ok);
+
+        std::ifstream stream(path, std::ios::binary);
+        assert(stream.is_open());
+        std::string line;
+        assert(std::getline(stream, line) && line == "CSEPROJ 2");
+        assert(std::getline(stream, line) &&
+            line == "WIRE 3 1 1 50.000000 15.000000 0 0 300.000000 115.000000 "
+                    "ROUTE 2 150.000000 15.000000 150.000000 115.000000");
+        assert(std::getline(stream, line) && line == "END");
+        stream.close();
+
+        const cse::Result<cse::SchematicSnapshot> loaded = cse::io::LoadProject(path);
+        assert(loaded.ok);
+        assert(loaded.value.wires.size() == 1);
+        assert(loaded.value.wires[0].route_points.size() == 2);
+        assert(loaded.value.wires[0].route_points[0].x == 150.0);
+        assert(loaded.value.wires[0].route_points[1].y == 115.0);
+        assert(loaded.value.wires[0].from.pin.has_value());
+        assert(!loaded.value.wires[0].to.pin.has_value());
+        std::filesystem::remove(path);
+
+        // 老工程（v1、没有 ROUTE 段）照常能打开
+        const std::string legacy_path = "cse_test_legacy_project.cseproj";
+        {
+            std::ofstream legacy(legacy_path, std::ios::binary);
+            assert(legacy.is_open());
+            legacy << "CSEPROJ 1\n"
+                   << "WIRE 4 1 1 50.000000 15.000000 0 0 300.000000 115.000000\n"
+                   << "END\n";
+        }
+        const cse::Result<cse::SchematicSnapshot> legacy_loaded = cse::io::LoadProject(legacy_path);
+        assert(legacy_loaded.ok);
+        assert(legacy_loaded.value.wires.size() == 1);
+        assert(legacy_loaded.value.wires[0].route_points.empty());
+        std::filesystem::remove(legacy_path);
+    }
+
+    // 折线导线中段被 T 形接上，也要算同一个网络。
+    void TestBuildNetsBentWireTJunction() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        snapshot.components.push_back(MakeComponent(1, "io.input", "IN1", 50.0, 85.0));      // OUT (100,100)
+        snapshot.components.push_back(MakeComponent(2, "io.output", "OUT1", 150.0, 165.0));  // IN (150,180)
+
+        // 折线 A：(100,100) → 拐点 (200,100) → (200,180)，起点挂在 IN1.OUT 上
+        cse::WireModel wire = MakeWire(1, 1, 1, {100.0, 100.0}, 0, 0, {200.0, 180.0});
+        wire.route_points = {{200.0, 100.0}};
+        snapshot.wires.push_back(wire);
+        // 折线 B：从 OUT1.IN 出发，终点落在 A 竖直段的中点 (200,140)
+        snapshot.wires.push_back(MakeWire(2, 2, 1, {150.0, 180.0}, 0, 0, {200.0, 140.0}));
+
+        const cse::model::BuiltNetlist netlist = cse::model::BuildNets(snapshot, library);
+        assert(netlist.nets.size() == 1);
+        assert(netlist.nets[0].pins.size() == 2);
+        assert(netlist.nets[0].pins[0].component_id == 1);
+        assert(netlist.nets[0].pins[1].component_id == 2);
+        assert(netlist.wire_nets.size() == 2);
+    }
+
+    // 元件挪动后端点变了，存下来的拐点可能出现斜线段：折线必须自动补直角。
+    void TestWirePolylineRepairsAfterMove() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        snapshot.components.push_back(MakeComponent(1, "io.input", "IN1", 0.0, 0.0));  // OUT (50,15)
+
+        cse::WireModel wire = MakeWire(1, 1, 1, {50.0, 15.0}, 0, 0, {300.0, 215.0});
+        wire.route_points = {{150.0, 15.0}, {150.0, 115.0}};  // 布线时定下的拐点
+        snapshot.wires.push_back(wire);
+
+        // 终点相当于被往下挪了 100：最后一段 (150,115)→(300,215) 是斜线，要补拐点
+        const std::vector<cse::Point2D> points = cse::model::WirePolyline(snapshot, library, wire);
+        assert(points.size() == 5);
+        assert(points[0].x == 50.0 && points[0].y == 15.0);
+        assert(points[1].x == 150.0 && points[1].y == 15.0);
+        assert(points[2].x == 150.0 && points[2].y == 115.0);
+        assert(points[3].x == 300.0 && points[3].y == 115.0);
+        assert(points[4].x == 300.0 && points[4].y == 215.0);
+        for (std::size_t index = 1; index < points.size(); ++index) {
+            const bool horizontal = std::abs(points[index].y - points[index - 1].y) < 0.5;
+            const bool vertical = std::abs(points[index].x - points[index - 1].x) < 0.5;
+            assert(horizontal || vertical);
+        }
+    }
+
     void TestLoadSnapshotIntegration() {
         cse::model::SchematicModel model;
         cse::component::ComponentLibrary library;
@@ -453,6 +725,12 @@ int main() {
     TestSimulationUnknownPropagation();
     TestSimulationOrNotGates();
     TestSimulationConflictAndDefaultLow();
+    TestWireRouteIsOrthogonalAndKeepsNetsApart();
+    TestPlanWireSegment();
+    TestEditorWireWithBends();
+    TestProjectRoutePointPersistence();
+    TestBuildNetsBentWireTJunction();
+    TestWirePolylineRepairsAfterMove();
     TestLoadSnapshotIntegration();
     TestKiCadNetlistExport();
     return 0;

@@ -12,7 +12,21 @@ namespace cse::io {
     namespace {
 
         constexpr const char* kMagic = "CSEPROJ";
-        constexpr int kFormatVersion = 1;
+        // 当前写入版本。没有拐点的工程仍写成 v1，这样旧版本程序还能打开；
+        // 出现拐点（ROUTE 段）才升到 v2。
+        constexpr int kFormatVersion = 2;
+        constexpr int kMinSupportedVersion = 1;
+        // 畸形文件里 ROUTE 数量可能是任意大数，先拦一道，避免按声明开数组。
+        constexpr std::size_t kMaxRoutePoints = 10000;
+
+        int VersionFor(const SchematicSnapshot& snapshot) {
+            for (const WireModel& wire : snapshot.wires) {
+                if (!wire.route_points.empty()) {
+                    return 2;
+                }
+            }
+            return 1;
+        }
 
         std::string FormatDouble(double value) {
             std::ostringstream stream;
@@ -54,7 +68,7 @@ namespace cse::io {
                 "cannot open for writing: " + path);
         }
 
-        stream << kMagic << ' ' << kFormatVersion << '\n';
+        stream << kMagic << ' ' << VersionFor(snapshot) << '\n';
 
         for (const ComponentInstance& component : snapshot.components) {
             stream << "COMP " << component.id << ' ' << component.type_id << ' '
@@ -69,7 +83,14 @@ namespace cse::io {
 
         for (const WireModel& wire : snapshot.wires) {
             stream << "WIRE " << wire.id << ' ' << FormatEndpoint(wire.from) << ' '
-                << FormatEndpoint(wire.to) << '\n';
+                << FormatEndpoint(wire.to);
+            if (!wire.route_points.empty()) {
+                stream << " ROUTE " << wire.route_points.size();
+                for (const Point2D& point : wire.route_points) {
+                    stream << ' ' << FormatDouble(point.x) << ' ' << FormatDouble(point.y);
+                }
+            }
+            stream << '\n';
         }
 
         stream << "END\n";
@@ -100,7 +121,7 @@ namespace cse::io {
                 return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
                     "bad header: " + line);
             }
-            if (version != kFormatVersion) {
+            if (version < kMinSupportedVersion || version > kFormatVersion) {
                 return Result<SchematicSnapshot>::Failure(ErrorCode::kUnsupportedFileVersion,
                     "unsupported version: " + std::to_string(version));
             }
@@ -158,6 +179,29 @@ namespace cse::io {
                 }
                 if (to_component != kInvalidComponentId) {
                     wire.to.pin = PinRef{to_component, to_pin};
+                }
+                // 可选尾段：ROUTE <数量> <x> <y> ...，画布上手工拐的弯存在这里。
+                std::string trailing;
+                if (row >> trailing) {
+                    if (trailing != "ROUTE") {
+                        return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                            "unknown WIRE field at line " + std::to_string(line_number));
+                    }
+                    std::size_t route_count = 0;
+                    if (!(row >> route_count) || route_count > kMaxRoutePoints) {
+                        return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                            "bad ROUTE count at line " + std::to_string(line_number));
+                    }
+                    wire.route_points.reserve(route_count);
+                    for (std::size_t index = 0; index < route_count; ++index) {
+                        Point2D point;
+                        if (!(row >> point.x >> point.y)) {
+                            return Result<SchematicSnapshot>::Failure(
+                                ErrorCode::kInvalidFileFormat,
+                                "bad ROUTE point at line " + std::to_string(line_number));
+                        }
+                        wire.route_points.push_back(point);
+                    }
                 }
                 snapshot.wires.push_back(std::move(wire));
             }

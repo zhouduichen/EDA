@@ -26,6 +26,7 @@ set(CSE_CORE_SOURCES
     src/io/project_serializer.cpp
     src/model/net_builder.cpp
     src/model/schematic_model.cpp
+    src/model/wire_route.cpp
     src/sim/logic_simulator.cpp
 )
 add_library(cse_core ${CSE_CORE_SOURCES})

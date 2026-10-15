@@ -88,7 +88,15 @@ std::string AddWireCommand::name() const {
 }
 
 bool AddWireCommand::Execute() {
-    return model_.AddWire(wire_);
+    // AddWire 会把传进去的 wire move 进模型，所以拿一份副本去调用：
+    // 命令自己要留着完整几何（含拐点）才能原样重做，
+    // 顺便把模型分配的 id 记回来，撤销时才找得到这条导线。
+    WireModel request = wire_;
+    if (!model_.AddWire(request)) {
+        return false;
+    }
+    wire_.id = request.id;
+    return true;
 }
 
 void AddWireCommand::Undo() {
