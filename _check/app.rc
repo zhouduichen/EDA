@@ -1,0 +1,9 @@
+///////////////////////////////////////////////////////////////////////////
+// app.rc -- resources for the standalone executable.
+//
+// wx/msw/wx.rc brings in the common-controls v6 manifest (modern look,
+// proper DPI awareness) plus the standard wx cursors, and must be included
+// by every Windows wxWidgets application.
+///////////////////////////////////////////////////////////////////////////
+
+#include "wx/msw/wx.rc"

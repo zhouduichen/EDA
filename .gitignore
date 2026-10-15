@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------- build output
+# Visual Studio drops everything it produces next to the sources.
+Project1/.vs/
+Project1/x64/
+Project1/Project1/x64/
+Project1/Project1.vcxproj.user
+_check/obj/
+_check/build/
+
+# ------------------------------------------------------- compiler / linker junk
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+*.exp
+*.res
+*.tlog
+*.recipe
+*.obj.dt.*
+*.manifest
+*.log
+*.suo
+*.user
+*.aps
+*.db
+
+# ------------------------------------------------------------ dead scaffolding
+# Early syntax-check experiment, kept on disk but not part of the project.
+_check/stub/
+
+# --------------------------------------------------------- WorkBuddy session data
+.workbuddy/
