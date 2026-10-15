@@ -14,6 +14,7 @@
 #include <map>
 #include <vector>
 #include "model.h"
+#include "wirenet.h"
 
 // Active tool.  The toolbar tools and the palette (tree) select one of these.
 enum Tool
@@ -133,6 +134,7 @@ private:
     // Where the path would land right now (refreshed on every mouse move).
     wxPoint m_wireTarget;
     bool    m_wireTargetOnPort = false;
+    bool    m_wireTargetIsOutput = false;   // so the route meets it from its side
     int     m_wireTargetComp = -1, m_wireTargetPort = -1;
     bool    m_wireTargetOnWire = false;
     int     m_wireTargetWire = -1;
@@ -181,6 +183,11 @@ private:
 
     std::vector<wxString> m_undo;
     std::vector<wxString> m_redo;
+
+    // Every component body as a rectangle a route must not cross.  Used by the
+    // live router and by the move repair, so a wire walks around a component
+    // instead of disappearing underneath it.
+    std::vector<wnRect> ComponentBlocks() const;
 
     // Coordinate transforms.
     wxPoint ToPx(const wxPoint& g) const;
@@ -248,6 +255,9 @@ private:
     void OnPaint(wxPaintEvent& e);
     void DrawScene(wxDC& dc);
     void DrawWire(wxDC& dc, const Wire& w);
+    // Blue overprint and end grips, so "this wire is selected -- dragging it
+    // now moves it" is impossible to miss.
+    void DrawWireSelection(wxDC& dc);
     void DrawJunctions(wxDC& dc);
     void DrawComponent(wxDC& dc, const Component& c);
     void DrawTextLabel(wxDC& dc, const TextLabel& t);

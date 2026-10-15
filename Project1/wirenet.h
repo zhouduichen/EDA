@@ -59,12 +59,21 @@ void wnExtendPath(std::vector<wxPoint>& path, const wxPoint& g);
 // appear when the user asks for them (click-to-place, "add vertex").
 // ---------------------------------------------------------------------------
 
-// Which axis a route has to use where it meets a point.
+// Which way the wire has to run next to a point.
+//
+// The directional values answer the question "on which side of this point does
+// the wire lie?" -- WN_LEFT means the neighbouring grid point is at x-1.  That
+// single meaning works for both ends of a route, which is what lets a pin say
+// "come at me from the left" without any special casing at the call site.
 enum wnSide
 {
     WN_ANY = 0,   // no constraint
-    WN_H,         // must leave / arrive horizontally
-    WN_V          // must leave / arrive vertically
+    WN_H,         // horizontally next to the point (either side)
+    WN_V,         // vertically next to the point (either side)
+    WN_LEFT,      // the wire lies to the left  (x-1)
+    WN_RIGHT,     // the wire lies to the right (x+1)
+    WN_UP,        // the wire lies above        (y-1)
+    WN_DOWN       // the wire lies below        (y+1)
 };
 
 // The axis a route would naturally take from a to b (the dominant offset,
@@ -77,6 +86,32 @@ wnSide wnAxisSide(const wxPoint& a, const wxPoint& b);
 // is room for it.  Never a staircase.
 void wnRoute(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
              std::vector<wxPoint>& out);
+
+// A blocked rectangle of grid cells, corners included.  Component bodies.
+struct wnRect
+{
+    int x0 = 0, y0 = 0, x1 = -1, y1 = -1;
+    bool Empty() const { return x1 < x0 || y1 < y0; }
+};
+
+// Route that keeps out of every blocked rectangle.
+//
+// The plain wnRoute answer is used unless something is really in the way, so a
+// wire that has nothing to avoid costs exactly what it costs today.  Only when
+// that answer crosses a component does a bounded grid search take over, and it
+// is the search that produces the "out of the pin, around the body, back into
+// the other pin" shape.
+//
+// Because a pin sits on the edge of its own body, the body also decides which
+// side the wire may approach from: an input pin on the left edge can only be
+// reached from the left.  The two end points themselves are exempt from the
+// blocking test, which is exactly what lets a wire touch the pin it belongs to.
+//
+// Should even the search come up empty (a component walled in on every side)
+// the plain route is returned, because a wire that crosses a body still
+// conducts while a wire that was never created does not.
+void wnRouteAvoid(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
+                  const std::vector<wnRect>& blocks, std::vector<wxPoint>& out);
 
 // Append a leg to a run, dropping the duplicated joint point.
 void wnJoinRun(std::vector<wxPoint>& run, const std::vector<wxPoint>& leg);

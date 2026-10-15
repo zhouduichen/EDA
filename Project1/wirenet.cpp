@@ -5,8 +5,11 @@
 #include "wirenet.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <functional>
 #include <map>
+#include <queue>
 
 namespace
 {
@@ -234,6 +237,252 @@ void wnExtendPath(std::vector<wxPoint>& path, const wxPoint& g)
 // Minimal routing
 // ---------------------------------------------------------------------------
 
+namespace
+{
+    // The directional sides are refinements of the two axis-only ones, so a
+    // shape that only cares about the axis can treat them the same way.
+    bool SideIsH(wnSide s) { return s == WN_H || s == WN_LEFT  || s == WN_RIGHT; }
+    bool SideIsV(wnSide s) { return s == WN_V || s == WN_UP    || s == WN_DOWN;  }
+
+    // Step directions: 0 = +x, 1 = -x, 2 = +y, 3 = -y.
+    const int kStepX[4] = {  1, -1,  0,  0 };
+    const int kStepY[4] = {  0,  0,  1, -1 };
+
+    int ReverseDir(int d) { return d ^ 1; }          // 0<->1, 2<->3
+
+    // May a wire whose neighbour lies in direction d leave / arrive here?
+    bool SideAllowsDir(wnSide s, int d)
+    {
+        switch (s)
+        {
+            case WN_H:     return d == 0 || d == 1;
+            case WN_V:     return d == 2 || d == 3;
+            case WN_LEFT:  return d == 1;
+            case WN_RIGHT: return d == 0;
+            case WN_UP:    return d == 3;
+            case WN_DOWN:  return d == 2;
+            default:       return true;              // WN_ANY
+        }
+    }
+
+    // Which of the four directions takes `from` one step towards `to`?  The
+    // points are usually adjacent; when they are not, the dominant axis wins,
+    // which is the direction the first step of the route would take anyway.
+    int DirTowards(const wxPoint& from, const wxPoint& to)
+    {
+        for (int d = 0; d < 4; ++d)
+            if (from.x + kStepX[d] == to.x && from.y + kStepY[d] == to.y) return d;
+        if (to.x > from.x) return 0;
+        if (to.x < from.x) return 1;
+        if (to.y > from.y) return 2;
+        if (to.y < from.y) return 3;
+        return -1;
+    }
+
+    // Is the single piece p->q free of every blocked rectangle?  The two ends
+    // of the whole route are allowed to sit inside one: that is precisely how
+    // a wire is able to touch the pin on the edge of its own component.
+    bool LegClear(const std::vector<wnRect>& blocks,
+                  const wxPoint& p, const wxPoint& q,
+                  const wxPoint& ex1, const wxPoint& ex2)
+    {
+        const bool horiz = (p.y == q.y);
+        const bool vert  = (p.x == q.x);
+        if (!horiz && !vert) return false;           // not a legal wire piece
+
+        for (size_t i = 0; i < blocks.size(); ++i)
+        {
+            const wnRect& r = blocks[i];
+            if (r.Empty()) continue;
+
+            int lo, hi, fixedAxis;                   // overlap along the run
+            if (horiz)
+            {
+                if (p.y < r.y0 || p.y > r.y1) continue;
+                lo    = std::max(std::min(p.x, q.x), r.x0);
+                hi    = std::min(std::max(p.x, q.x), r.x1);
+                fixedAxis = p.y;
+            }
+            else
+            {
+                if (p.x < r.x0 || p.x > r.x1) continue;
+                lo    = std::max(std::min(p.y, q.y), r.y0);
+                hi    = std::min(std::max(p.y, q.y), r.y1);
+                fixedAxis = p.x;
+            }
+            if (lo > hi) continue;
+
+            int free_ = hi - lo + 1;                 // cells of the overlap
+            for (int t = 0; t < 2; ++t)
+            {
+                const wxPoint& e = (t == 0) ? ex1 : ex2;
+                if (t == 1 && ex2 == ex1) break;     // do not exempt twice
+                const int along = horiz ? e.x : e.y;
+                const int other = horiz ? e.y : e.x;
+                if (other != fixedAxis) continue;
+                if (along < lo || along > hi) continue;
+                --free_;
+            }
+            if (free_ > 0) return false;
+        }
+        return true;
+    }
+
+    // A finished route is acceptable when no piece crosses a component and
+    // both ends meet the direction they were asked for.
+    bool RouteOK(const std::vector<wnRect>& blocks, const std::vector<wxPoint>& pts,
+                 wnSide aSide, wnSide bSide)
+    {
+        if (pts.size() < 2) return true;
+        const wxPoint a = pts.front();
+        const wxPoint b = pts.back();
+
+        for (size_t i = 0; i + 1 < pts.size(); ++i)
+            if (!LegClear(blocks, pts[i], pts[i + 1], a, b)) return false;
+
+        const int d0 = DirTowards(a, pts[1]);
+        if (d0 >= 0 && !SideAllowsDir(aSide, d0)) return false;
+
+        const int dn = DirTowards(b, pts[pts.size() - 2]);
+        if (dn >= 0 && !SideAllowsDir(bSide, dn)) return false;
+        return true;
+    }
+
+    // Bounded grid search.  Returns false when nothing gets there, leaving the
+    // caller free to use the plain route instead.
+    bool SearchAvoid(const wxPoint& a, const wxPoint& b,
+                     wnSide aSide, wnSide bSide,
+                     const std::vector<wnRect>& blocks,
+                     std::vector<wxPoint>& out)
+    {
+        // ---- the window: the two ends plus room to get round anything ----
+        int xlo = std::min(a.x, b.x) - 4, xhi = std::max(a.x, b.x) + 4;
+        int ylo = std::min(a.y, b.y) - 4, yhi = std::max(a.y, b.y) + 4;
+
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            bool grew = false;
+            for (size_t i = 0; i < blocks.size(); ++i)
+            {
+                const wnRect& r = blocks[i];
+                if (r.Empty()) continue;
+                if (r.x1 < xlo || r.x0 > xhi || r.y1 < ylo || r.y0 > yhi) continue;
+                if (r.x0 - 2 < xlo) { xlo = r.x0 - 2; grew = true; }
+                if (r.x1 + 2 > xhi) { xhi = r.x1 + 2; grew = true; }
+                if (r.y0 - 2 < ylo) { ylo = r.y0 - 2; grew = true; }
+                if (r.y1 + 2 > yhi) { yhi = r.y1 + 2; grew = true; }
+            }
+            if (!grew) break;
+        }
+
+        const int W = xhi - xlo + 1;
+        const int H = yhi - ylo + 1;
+        if (W < 1 || H < 1 || W > 160 || H > 160) return false;
+        if (a.x < xlo || a.x > xhi || a.y < ylo || a.y > yhi) return false;
+        if (b.x < xlo || b.x > xhi || b.y < ylo || b.y > yhi) return false;
+
+        // ---- blocked cells (the two ends are always reachable) ------------
+        const int N = W * H;
+        std::vector<unsigned char> blk(N, 0);
+        for (size_t i = 0; i < blocks.size(); ++i)
+        {
+            const wnRect& r = blocks[i];
+            if (r.Empty()) continue;
+            const int bx0 = std::max(xlo, r.x0), bx1 = std::min(xhi, r.x1);
+            const int by0 = std::max(ylo, r.y0), by1 = std::min(yhi, r.y1);
+            for (int x = bx0; x <= bx1; ++x)
+                for (int y = by0; y <= by1; ++y)
+                    blk[(x - xlo) * H + (y - ylo)] = 1;
+        }
+        const int idxA = (a.x - xlo) * H + (a.y - ylo);
+        const int idxB = (b.x - xlo) * H + (b.y - ylo);
+        blk[idxA] = 0;
+        blk[idxB] = 0;
+        if (idxA == idxB) { out.clear(); out.push_back(a); return true; }
+
+        // ---- cheapest route, bends charged extra --------------------------
+        const int kBend = 2;
+        std::vector<int> dist(N * 4, INT_MAX);
+        std::vector<int> prev(N * 4, -1);
+        std::priority_queue<std::pair<int, int>,
+                            std::vector<std::pair<int, int>>,
+                            std::greater<std::pair<int, int>>> pq;
+
+        for (int d = 0; d < 4; ++d)
+        {
+            if (!SideAllowsDir(aSide, d)) continue;
+            const int nx = a.x + kStepX[d], ny = a.y + kStepY[d];
+            if (nx < xlo || nx > xhi || ny < ylo || ny > yhi) continue;
+            const int ni = (nx - xlo) * H + (ny - ylo);
+            if (blk[ni]) continue;
+            const int st = ni * 4 + d;
+            dist[st] = 1;
+            prev[st] = -2;                       // -2 = "the step before is a"
+            pq.push(std::make_pair(1, st));
+        }
+
+        int goal = -1;
+        while (!pq.empty())
+        {
+            const std::pair<int, int> top = pq.top();
+            pq.pop();
+            if (top.first != dist[top.second]) continue;      // stale entry
+
+            const int st   = top.second;
+            const int cost = top.first;
+            const int node = st / 4;
+            const int d    = st % 4;
+
+            if (node == idxB && SideAllowsDir(bSide, ReverseDir(d)))
+            {
+                goal = st;                       // arrived from the right side
+                break;
+            }
+
+            const int x = xlo + node / H;
+            const int y = ylo + node % H;
+            for (int nd = 0; nd < 4; ++nd)
+            {
+                if (nd == ReverseDir(d)) continue;            // never a U turn
+                const int nx = x + kStepX[nd], ny = y + kStepY[nd];
+                if (nx < xlo || nx > xhi || ny < ylo || ny > yhi) continue;
+                const int ni = (nx - xlo) * H + (ny - ylo);
+                if (blk[ni]) continue;
+                const int ns = ni * 4 + nd;
+                const int nc = cost + 1 + (nd == d ? 0 : kBend);
+                if (nc >= dist[ns]) continue;
+                dist[ns] = nc;
+                prev[ns] = st;
+                pq.push(std::make_pair(nc, ns));
+            }
+        }
+        if (goal < 0) return false;
+
+        // ---- walk it back and keep only the corners -----------------------
+        std::vector<wxPoint> steps;
+        for (int st = goal; st != -2; st = prev[st])
+        {
+            const int node = st / 4;
+            steps.push_back(wxPoint(xlo + node / H, ylo + node % H));
+        }
+        steps.push_back(a);
+        std::reverse(steps.begin(), steps.end());
+
+        out.clear();
+        out.push_back(steps.front());
+        for (size_t i = 1; i + 1 < steps.size(); ++i)
+        {
+            const wxPoint in  = steps[i]     - steps[i - 1];
+            const wxPoint out_ = steps[i + 1] - steps[i];
+            const bool straight = (in.x == 0 && out_.x == 0) || (in.y == 0 && out_.y == 0);
+            if (!straight) out.push_back(steps[i]);
+        }
+        out.push_back(steps.back());
+        wnNormalize(out);
+        return true;
+    }
+}
+
 wnSide wnAxisSide(const wxPoint& a, const wxPoint& b)
 {
     const int dx = std::abs(b.x - a.x);
@@ -254,7 +503,7 @@ void wnRoute(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
     // Both ends want the same axis.  A single bend cannot satisfy that, so the
     // route goes out, across and back in again -- the classic Z.  It needs room
     // on the axis, otherwise the single bend below has to do.
-    if (aSide == WN_H && bSide == WN_H && b.x - a.x >= 3)
+    if (SideIsH(aSide) && SideIsH(bSide) && b.x - a.x >= 3)
     {
         const int mx = a.x + (b.x - a.x) / 2;
         out.push_back(wxPoint(mx, a.y));
@@ -262,7 +511,7 @@ void wnRoute(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
         out.push_back(b);
         return;
     }
-    if (aSide == WN_V && bSide == WN_V && b.y - a.y >= 3)
+    if (SideIsV(aSide) && SideIsV(bSide) && b.y - a.y >= 3)
     {
         const int my = a.y + (b.y - a.y) / 2;
         out.push_back(wxPoint(a.x, my));
@@ -273,10 +522,41 @@ void wnRoute(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
 
     // One bend.  The arrival matters most, so the target side picks the corner;
     // a target that does not care falls in line with the source.
-    bool cornerAtTargetX = (bSide == WN_V);
-    if (bSide == WN_ANY) cornerAtTargetX = (aSide == WN_H);
+    bool cornerAtTargetX = SideIsV(bSide);
+    if (bSide == WN_ANY) cornerAtTargetX = SideIsH(aSide);
     out.push_back(cornerAtTargetX ? wxPoint(b.x, a.y) : wxPoint(a.x, b.y));
     out.push_back(b);
+}
+
+void wnRouteAvoid(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
+                  const std::vector<wnRect>& blocks, std::vector<wxPoint>& out)
+{
+    // Nothing in the way costs nothing: the answer is byte for byte what
+    // wnRoute would have produced, so a wire drawn in open canvas is not
+    // "improved" behind the user's back.
+    std::vector<wxPoint> plain;
+    wnRoute(a, b, aSide, bSide, plain);
+    if (plain.size() < 2 || RouteOK(blocks, plain, aSide, bSide))
+    {
+        out = plain;
+        return;
+    }
+
+    // Something really is standing in the corridor.  Search with the sides the
+    // caller asked for; if even that fails, drop the directional demand and
+    // keep only the axis -- a wire that meets a pin from the wrong side still
+    // conducts, while a wire that was never laid does not.
+    if (SearchAvoid(a, b, aSide, bSide, blocks, out)) return;
+
+    const wnSide relaxA = SideIsH(aSide) ? WN_H : (SideIsV(aSide) ? WN_V : WN_ANY);
+    const wnSide relaxB = SideIsH(bSide) ? WN_H : (SideIsV(bSide) ? WN_V : WN_ANY);
+    if (SearchAvoid(a, b, relaxA, relaxB, blocks, out)) return;
+
+    std::vector<wxPoint> fallback;
+    wnRoute(a, b, relaxA, relaxB, fallback);
+    if (RouteOK(blocks, fallback, relaxA, relaxB)) { out = fallback; return; }
+
+    out = plain;
 }
 
 void wnJoinRun(std::vector<wxPoint>& run, const std::vector<wxPoint>& leg)

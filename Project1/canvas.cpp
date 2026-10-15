@@ -20,6 +20,12 @@ namespace
     // Order for grid points (see wirenet.h).
     typedef wnPtLess PtLess;
 
+    // Every component here keeps its inputs on the left edge and its outputs
+    // on the right edge, so the rule a route has to respect is simply that:
+    // an input is fed from the left, an output drives to the right.  Naming it
+    // once is what keeps the router, the move repair and the end drag honest.
+    wnSide PortSide(bool isOutput) { return isOutput ? WN_RIGHT : WN_LEFT; }
+
     const double kPi = 3.14159265358979323846;
     struct DPt { double x, y; DPt(double X = 0, double Y = 0) : x(X), y(Y) {} };
 
@@ -408,6 +414,7 @@ void CircuitCanvas::StartWire(int compId, int portIdx, const wxPoint& px)
     m_wireTargetComp   = -1;
     m_wireTargetPort   = -1;
     m_wireTargetWire   = -1;
+    m_wireTargetIsOutput = false;
 
     if (!HasCapture()) CaptureMouse();
     Status(wxT("连线：按住左键拖动到目标端口 / 导线后松开，右键或 Esc 取消；也可以直接松开左键逐点点击布线"));
@@ -436,6 +443,7 @@ void CircuitCanvas::StartWireAtPoint(const wxPoint& grid, const wxPoint& px)
     m_wireTargetComp   = -1;
     m_wireTargetPort   = -1;
     m_wireTargetWire   = -1;
+    m_wireTargetIsOutput = false;
 
     if (!HasCapture()) CaptureMouse();
     Status(wxT("分叉连线：拖到目标端口、导线或空白处后松开"));
@@ -451,6 +459,7 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
     m_wireTargetComp   = -1;
     m_wireTargetPort   = -1;
     m_wireTargetWire   = -1;
+    m_wireTargetIsOutput = false;
     m_wireTarget       = ToGrid(px);
 
     // Say out loud what a release would do right now.  Without this the user
@@ -487,10 +496,11 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
             const Port* p = m_circuit->FindPort(compId, portIdx);
             if (p)
             {
-                m_wireTarget       = p->grid;
-                m_wireTargetOnPort = true;
-                m_wireTargetComp   = compId;
-                m_wireTargetPort   = portIdx;
+                m_wireTarget         = p->grid;
+                m_wireTargetOnPort   = true;
+                m_wireTargetComp     = compId;
+                m_wireTargetPort     = portIdx;
+                m_wireTargetIsOutput = p->isOutput;
                 hint();
                 return;
             }
@@ -515,10 +525,11 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
             if (d2 < best)
             {
                 best = d2;
-                m_wireTarget       = body->ports[i].grid;
-                m_wireTargetOnPort = true;
-                m_wireTargetComp   = body->id;
-                m_wireTargetPort   = (int)i;
+                m_wireTarget         = body->ports[i].grid;
+                m_wireTargetOnPort   = true;
+                m_wireTargetComp     = body->id;
+                m_wireTargetPort     = (int)i;
+                m_wireTargetIsOutput = body->ports[i].isOutput;
             }
         }
         if (m_wireTargetOnPort) { hint(); return; }
@@ -550,6 +561,27 @@ void CircuitCanvas::UpdateWirePath(const wxPoint& g)
     ComputeRouted(g);
 }
 
+// Every component body, as a rectangle a route is not allowed to cross.  A pin
+// sits ON the edge of its own body, and the router exempts the two ends of a
+// route from the blocking test, which is what lets the wire reach the pin while
+// still refusing to run underneath the component.
+std::vector<wnRect> CircuitCanvas::ComponentBlocks() const
+{
+    std::vector<wnRect> out;
+    if (!m_circuit) return out;
+    out.reserve(m_circuit->comps.size());
+    for (const Component& c : m_circuit->comps)
+    {
+        wnRect r;
+        r.x0 = c.gridPos.x;
+        r.y0 = c.gridPos.y;
+        r.x1 = c.gridPos.x + c.Width();
+        r.y1 = c.gridPos.y + c.Height();
+        out.push_back(r);
+    }
+    return out;
+}
+
 void CircuitCanvas::ComputeRouted(const wxPoint& target)
 {
     m_routed = m_wirePrefix;
@@ -557,15 +589,19 @@ void CircuitCanvas::ComputeRouted(const wxPoint& target)
 
     const wxPoint from = m_routed.back();
 
-    // A component pin is always met from the side (every component here has its
-    // pins on the left / right edge); anywhere else the pull direction decides.
-    wnSide aSide = WN_H;
-    if (!m_wireSrcIsPort || m_routed.size() > 1)
+    // Leaving a pin: inputs are fed from the left, outputs drive to the right.
+    // Anywhere else (a corner the user pinned, a branch point on a wire) the
+    // pull direction decides the first step.
+    wnSide aSide = WN_ANY;
+    if (m_wireSrcIsPort && m_routed.size() == 1)
+        aSide = PortSide(m_wireSrcIsOutput);
+    else
         aSide = wnAxisSide(from, target);
-    const wnSide bSide = m_wireTargetOnPort ? WN_H : WN_ANY;
+
+    const wnSide bSide = m_wireTargetOnPort ? PortSide(m_wireTargetIsOutput) : WN_ANY;
 
     std::vector<wxPoint> leg;
-    wnRoute(from, target, aSide, bSide, leg);
+    wnRouteAvoid(from, target, aSide, bSide, ComponentBlocks(), leg);
     wnJoinRun(m_routed, leg);
 }
 
@@ -724,6 +760,7 @@ void CircuitCanvas::CancelWire()
     m_wireSrcIsPort    = false;
     m_wireSrcIsOutput  = false;
     m_wireTargetOnPort = false;
+    m_wireTargetIsOutput = false;
     m_wireTargetOnWire = false;
     m_wireTargetComp   = -1;
     m_wireTargetPort   = -1;
@@ -792,14 +829,14 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
     const std::map<wxPoint, wxPoint, PtLess> disp =
         wnBuildDisplacement(segs, dragIdx, portMove, delta);
 
-    // ---- where does one end of a snapshot wire go? ------------------------
-    //   * a dragged segment keeps its shape and comes off its port
+    // ---- where does one end of a snapshot run go? -------------------------
+    //   * a dragged run keeps its shape and comes off its port
     //   * an end that owns a port follows that port
     //   * anything else consults the displacement table
-    auto resolveEnd = [&](const Wire& w, const wxPoint& oldPt,
+    auto resolveEnd = [&](bool dragged, const wxPoint& oldPt,
                           int comp, int port, int& outComp, int& outPort) -> wxPoint
     {
-        if (w.selected) { outComp = outPort = -1; return oldPt + delta; }
+        if (dragged) { outComp = outPort = -1; return oldPt + delta; }
         if (comp >= 0)
         {
             const Port* p = m_circuit->FindPort(comp, port);
@@ -826,65 +863,61 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
         v.push_back(w);
     };
 
-    // ---- re-lay every segment --------------------------------------------
+    // Component bodies: a re-laid run has to walk around them, never under.
+    const std::vector<wnRect> blocks = ComponentBlocks();
+
+    // ---- re-lay every run ------------------------------------------------
     std::vector<Wire> out;
     out.reserve(m_wireSnapshot.size() * 2 + 4);
 
-    // How many segments each run has.  Re-routing a single straight run is
-    // safe; a run the user built out of several segments (a deliberate
-    // zig-zag) must only be stretched, or the new shape would disagree with
-    // the pieces around it.
-    std::map<int, int> runSize;
-    for (const Wire& w : m_wireSnapshot)
-        if (w.points.size() == 2) runSize[w.group]++;
-
-    for (const Wire& w : m_wireSnapshot)
+    // A run drawn by the router is one Wire per segment, all sharing a group
+    // id.  Repairing them one segment at a time is what left a wire lying
+    // across a component after a drag: the piece next to the pin kept going in
+    // whichever direction it happened to have -- straight into the body.
+    std::vector<int> groupOrder;
+    std::map<int, std::vector<size_t>> byGroup;
+    for (size_t i = 0; i < m_wireSnapshot.size(); ++i)
     {
+        const Wire& w = m_wireSnapshot[i];
         if (w.points.size() != 2) continue;
-
-        int aComp = -1, aPort = -1, bComp = -1, bPort = -1;
-        const wxPoint na = resolveEnd(w, w.points[0], w.srcComp, w.srcPort, aComp, aPort);
-        const wxPoint nb = resolveEnd(w, w.points[1], w.dstComp, w.dstPort, bComp, bPort);
-
-        // A wire nothing happened to keeps the shape the user gave it, bends
-        // and all.  Only the ones that really moved get re-laid.
-        if (na == w.points[0] && nb == w.points[1]) { pushUnique(out, w); continue; }
-
-        // An end that is glued to a component pin has to keep meeting it from
-        // the side, so the whole run becomes the shortest route that can do
-        // that.  Without this the bend landed hard against the pin and the wire
-        // left a gate's output going straight down.
-        if ((aComp >= 0 || bComp >= 0) && runSize[w.group] == 1)
+        std::map<int, std::vector<size_t>>::iterator it = byGroup.find(w.group);
+        if (it == byGroup.end())
         {
-            std::vector<wxPoint> route;
-            wnRoute(na, nb, aComp >= 0 ? WN_H : WN_ANY, bComp >= 0 ? WN_H : WN_ANY, route);
-
-            for (size_t k = 0; k + 1 < route.size(); ++k)
-            {
-                Wire nw = w;
-                nw.points.clear();
-                nw.points.push_back(route[k]);
-                nw.points.push_back(route[k + 1]);
-                nw.srcComp = nw.srcPort = nw.dstComp = nw.dstPort = -1;
-                if (k == 0)                 { nw.srcComp = aComp; nw.srcPort = aPort; }
-                if (k + 2 == route.size())  { nw.dstComp = bComp; nw.dstPort = bPort; }
-                pushUnique(out, nw);
-            }
-            continue;
+            byGroup[w.group].push_back(i);
+            groupOrder.push_back(w.group);
         }
+        else it->second.push_back(i);
+    }
 
-        const std::vector<wnRelocPiece> pieces = wnRelocate(w.points[0], w.points[1], na, nb);
+    // Stretch one straight piece: the old fallback, still the right answer for
+    // a run the user is dragging around by hand.
+    auto relocateOne = [&](size_t wi, bool reversed) -> void
+    {
+        const Wire& c    = m_wireSnapshot[wi];
+        const wxPoint s  = c.points[reversed ? 1 : 0];
+        const wxPoint e  = c.points[reversed ? 0 : 1];
+        const int sComp0 = reversed ? c.dstComp : c.srcComp;
+        const int sPort0 = reversed ? c.dstPort : c.srcPort;
+        const int eComp0 = reversed ? c.srcComp : c.dstComp;
+        const int ePort0 = reversed ? c.srcPort : c.dstPort;
+
+        int ca = -1, cpa = -1, cb = -1, cpb = -1;
+        const wxPoint ns = resolveEnd(c.selected, s, sComp0, sPort0, ca, cpa);
+        const wxPoint ne = resolveEnd(c.selected, e, eComp0, ePort0, cb, cpb);
+
+        // A piece nothing happened to keeps the shape the user gave it.
+        if (ns == s && ne == e) { pushUnique(out, c); return; }
 
         auto bind = [&](int src, int& comp, int& port) -> void
         {
-            if      (src == 0) { comp = aComp; port = aPort; }
-            else if (src == 1) { comp = bComp; port = bPort; }
-            else               { comp = -1;    port = -1;    }  // inserted jog
+            if      (src == 0) { comp = ca; port = cpa; }
+            else if (src == 1) { comp = cb; port = cpb; }
+            else               { comp = -1; port = -1;  }   // inserted jog
         };
 
-        for (const wnRelocPiece& pc : pieces)
+        for (const wnRelocPiece& pc : wnRelocate(s, e, ns, ne))
         {
-            Wire nw = w;
+            Wire nw = c;
             nw.points.clear();
             nw.points.push_back(pc.a);
             nw.points.push_back(pc.b);
@@ -892,6 +925,139 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
             bind(pc.srcB, nw.dstComp, nw.dstPort);
             pushUnique(out, nw);
         }
+    };
+
+    for (size_t gi = 0; gi < groupOrder.size(); ++gi)
+    {
+        const int                  gid = groupOrder[gi];
+        const std::vector<size_t>& idx = byGroup[gid];
+
+        // Chain the pieces end to end.  A run that does not chain (somebody
+        // cut it into disjoint pieces by hand) is repaired the old way.
+        std::vector<size_t> chain;
+        std::vector<char>   rev;
+        {
+            std::vector<char> taken(idx.size(), 0);
+            chain.push_back(idx[0]);
+            rev.push_back(0);
+            taken[0] = 1;
+            while (chain.size() < idx.size())
+            {
+                const Wire& last = m_wireSnapshot[chain.back()];
+                const wxPoint tail = rev.back() ? last.points[0] : last.points[1];
+                bool found = false;
+                for (size_t k = 0; k < idx.size() && !found; ++k)
+                {
+                    if (taken[k]) continue;
+                    const Wire& c = m_wireSnapshot[idx[k]];
+                    if (c.points[0] == tail)      { chain.push_back(idx[k]); rev.push_back(0); taken[k] = 1; found = true; }
+                    else if (c.points[1] == tail) { chain.push_back(idx[k]); rev.push_back(1); taken[k] = 1; found = true; }
+                }
+                if (!found) break;
+            }
+            if (chain.size() != idx.size()) { chain.clear(); rev.clear(); }
+        }
+        if (chain.empty())
+        {
+            for (size_t k = 0; k < idx.size(); ++k) relocateOne(idx[k], false);
+            continue;
+        }
+
+        std::vector<wxPoint> pts;
+        for (size_t k = 0; k < chain.size(); ++k)
+        {
+            const Wire& c = m_wireSnapshot[chain[k]];
+            if (k == 0) pts.push_back(c.points[rev[k] ? 1 : 0]);
+            pts.push_back(c.points[rev[k] ? 0 : 1]);
+        }
+
+        bool runSelected = false;
+        for (size_t k = 0; k < chain.size(); ++k)
+            if (m_wireSnapshot[chain[k]].selected) runSelected = true;
+
+        const Wire& w0 = m_wireSnapshot[chain.front()];
+        const Wire& wN = m_wireSnapshot[chain.back()];
+        const int aComp0 = rev.front() ? w0.dstComp : w0.srcComp;
+        const int aPort0 = rev.front() ? w0.dstPort : w0.srcPort;
+        const int bComp0 = rev.back()  ? wN.srcComp : wN.dstComp;
+        const int bPort0 = rev.back()  ? wN.srcPort : wN.dstPort;
+
+        int aComp = -1, aPort = -1, bComp = -1, bPort = -1;
+        const wxPoint na = resolveEnd(runSelected, pts.front(), aComp0, aPort0, aComp, aPort);
+        const wxPoint nb = resolveEnd(runSelected, pts.back(),  bComp0, bPort0, bComp, bPort);
+
+        // Nothing moved: keep the shape the user gave the run, bends included.
+        if (na == pts.front() && nb == pts.back())
+        {
+            for (size_t k = 0; k < chain.size(); ++k) pushUnique(out, m_wireSnapshot[chain[k]]);
+            continue;
+        }
+
+        // An end glued to a component pin has to keep meeting it from the side,
+        // and the run has to walk around the body instead of under it.  Both
+        // are one job for the router.
+        if (aComp >= 0 || bComp >= 0)
+        {
+            // Interior corners are free for the router to drop -- except where
+            // another wire or a connection mark actually hangs off them, which
+            // would tear a branch away.
+            std::vector<wxPoint> way;
+            for (size_t k = 1; k + 1 < pts.size(); ++k)
+            {
+                wxPoint p = pts[k];
+                std::map<wxPoint, wxPoint, PtLess>::const_iterator dit = disp.find(p);
+                if (dit != disp.end()) p = dit->second;
+
+                bool anchor = false;
+                for (const wxPoint& j : m_circuit->junctions)
+                    if (j == p || j == pts[k]) { anchor = true; break; }
+                for (const Wire& o : m_wireSnapshot)
+                {
+                    if (anchor || o.points.size() != 2) continue;
+                    if (o.group == gid) continue;          // a corner of this run
+                    if (o.points[0] == p || o.points[1] == p) { anchor = true; break; }
+                }
+                if (anchor) way.push_back(p);
+            }
+            way.push_back(nb);
+
+            const Port* pa = (aComp >= 0) ? m_circuit->FindPort(aComp, aPort) : nullptr;
+            const Port* pb = (bComp >= 0) ? m_circuit->FindPort(bComp, bPort) : nullptr;
+
+            std::vector<wxPoint> path;
+            wxPoint from    = na;
+            wnSide  curSide = pa ? PortSide(pa->isOutput) : WN_ANY;
+            for (size_t k = 0; k < way.size(); ++k)
+            {
+                const bool lastLeg = (k + 1 == way.size());
+                const wnSide endSide = lastLeg && pb ? PortSide(pb->isOutput) : WN_ANY;
+                std::vector<wxPoint> leg;
+                wnRouteAvoid(from, way[k], curSide, endSide, blocks, leg);
+                wnJoinRun(path, leg);
+                from    = way[k];
+                curSide = WN_ANY;
+            }
+
+            if (path.size() >= 2)
+            {
+                const Wire& tmpl = m_wireSnapshot[chain.front()];
+                for (size_t k = 0; k + 1 < path.size(); ++k)
+                {
+                    if (path[k] == path[k + 1]) continue;
+                    Wire nw = tmpl;
+                    nw.points.clear();
+                    nw.points.push_back(path[k]);
+                    nw.points.push_back(path[k + 1]);
+                    nw.srcComp = nw.srcPort = nw.dstComp = nw.dstPort = -1;
+                    if (k == 0)                { nw.srcComp = aComp; nw.srcPort = aPort; }
+                    if (k + 2 == path.size())  { nw.dstComp = bComp; nw.dstPort = bPort; }
+                    pushUnique(out, nw);
+                }
+                continue;
+            }
+        }
+
+        for (size_t k = 0; k < chain.size(); ++k) relocateOne(chain[k], rev[k] != 0);
     }
 
     m_circuit->wires.swap(out);
@@ -1098,6 +1264,20 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
         if (HasCapture()) ReleaseMouse();
         Refresh();
         return;
+    }
+
+    // Hovering over a wire says what a drag would do, because the answer
+    // depends on whether the wire happens to be selected -- and that is
+    // exactly the thing that used to surprise people ("I dragged and the whole
+    // wire moved off").
+    if (e.Moving() && m_tool == TOOL_EDIT && !m_drawingWire && !m_moving &&
+        !m_movingWire && !m_draggingEnd && !m_wireBranchPending &&
+        !m_rubberBanding && !m_panning)
+    {
+        int seg = -1;
+        wxPoint snap;
+        if (HitWire(px, seg, snap) >= 0)
+            Status(wxT("导线：按住拖动 = 从这里分叉一条新线；先单击选中，再拖动才是移动"));
     }
 
     if (e.LeftDown())
@@ -1359,7 +1539,12 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
     int wireIndex = HitWire(px, wireSegment, wireSnap);
     if (wireIndex >= 0)
     {
-        // Grabbing a loose end of an existing wire stretches that very wire.
+        // Grabbing a loose end of an existing wire stretches that very wire --
+        // but only once the wire is selected.  On a wire the user has NOT
+        // selected, a press-and-drag means one thing and one thing only:
+        // "start a new wire from right here".  That is the whole point of the
+        // click-first-then-drag rule, and it is why an unselected wire can no
+        // longer be yanked around by accident.
         int freeIdx = -1;
         wxPoint freeEnd;
         const bool onFreeEnd =
@@ -1369,7 +1554,7 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
         const bool wasSelected = m_circuit->wires[wireIndex].selected;
         const bool forceBranch = e.ControlDown() || e.AltDown();
 
-        if (onFreeEnd && !wasSelected && !forceBranch)
+        if (onFreeEnd && wasSelected && !forceBranch)
         {
             m_draggingEnd          = true;
             m_endWireIndex         = wireIndex;
@@ -1384,6 +1569,8 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
 
         // Not selected yet (or Ctrl/Alt): the press is "pending".  Drag ->
         // branch a new wire out of this point, release -> select the segment.
+        // The branch starts at the nearest grid point of the wire, wherever on
+        // the wire the pointer happens to be.
         if (!wasSelected || forceBranch)
         {
             m_wireBranchPending  = true;
@@ -1391,7 +1578,7 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
             m_wireBranchPoint    = wireSnap;
             m_dragWireIndex      = wireIndex;
             CaptureMouse();
-            Status(wxT("拖动可从该位置分叉一条新导线；直接松开则选中该段"));
+            Status(wxT("拖动即从这一点分叉一条新导线；直接松开则选中该段（选中后再拖动是移动）"));
             Refresh();
             return;
         }
@@ -1532,7 +1719,14 @@ void CircuitCanvas::OnWireEndDrag(const wxMouseEvent& e)
 
     std::vector<wxPoint> route;
     if (fixedComp >= 0)
-        wnRoute(fixed, target, WN_H, targetOnPort ? WN_H : WN_ANY, route);
+    {
+        const Port* fp = m_circuit->FindPort(fixedComp, fixedPort);
+        const Port* tp = targetOnPort ? m_circuit->FindPort(compId, portIdx) : nullptr;
+        wnRouteAvoid(fixed, target,
+                     fp ? PortSide(fp->isOutput) : WN_H,
+                     tp ? PortSide(tp->isOutput) : WN_ANY,
+                     ComponentBlocks(), route);
+    }
 
     std::vector<Wire> out;
     if (!route.empty())
@@ -2218,6 +2412,7 @@ void CircuitCanvas::DrawScene(wxDC& dc)
     DrawJunctions(dc);
     for (auto& c : m_circuit->comps) DrawComponent(dc, c);
     for (auto& t : m_circuit->texts) DrawTextLabel(dc, t);
+    DrawWireSelection(dc);
     DrawPortDots(dc);
 
     // Live wire preview: exactly the geometry a release would commit.
@@ -2265,9 +2460,11 @@ void CircuitCanvas::DrawWire(wxDC& dc, const Wire& w)
         col = ValueColour(w.value);
     for (size_t i = 0; i + 1 < w.points.size(); ++i)
     {
-        bool segmentSelected = w.selected &&
+        const bool segmentSelected = w.selected &&
             (w.selectedSegment < 0 || w.selectedSegment == (int)i);
-        dc.SetPen(wxPen(col, segmentSelected ? 4 : 3));
+        if (segmentSelected) continue;      // painted by DrawWireSelection
+
+        dc.SetPen(wxPen(col, 3));
         wxPoint a = ToPx(w.points[i]);
         wxPoint b = ToPx(w.points[i + 1]);
         if (a.x == b.x || a.y == b.y)
@@ -2281,6 +2478,71 @@ void CircuitCanvas::DrawWire(wxDC& dc, const Wire& w)
             dc.DrawLine(corner, b);
         }
     }
+}
+
+// Selection has to be impossible to miss, because it changes what a drag does:
+// an unselected wire sprouts a new wire, a selected one moves.  A blue
+// overprint plus a grip on every loose end says which one it is; the grips are
+// painted after the components so nothing can hide them.
+void CircuitCanvas::DrawWireSelection(wxDC& dc)
+{
+    if (!m_circuit) return;
+
+    bool any = false;
+    for (const Wire& w : m_circuit->wires) if (w.selected) { any = true; break; }
+    if (!any) return;
+
+    auto stroke = [&](const wxPoint& a, const wxPoint& b, const wxColour& c, int width)
+    {
+        dc.SetPen(wxPen(c, width));
+        if (a.x == b.x || a.y == b.y) { dc.DrawLine(a, b); return; }
+        const wxPoint corner(b.x, a.y);
+        dc.DrawLine(a, corner);
+        dc.DrawLine(corner, b);
+    };
+
+    for (const Wire& w : m_circuit->wires)
+    {
+        if (!w.selected) continue;
+        wxColour col(30, 30, 30);
+        if (m_sim) col = ValueColour(w.value);
+
+        for (size_t i = 0; i + 1 < w.points.size(); ++i)
+        {
+            if (w.selectedSegment >= 0 && w.selectedSegment != (int)i) continue;
+            const wxPoint a = ToPx(w.points[i]);
+            const wxPoint b = ToPx(w.points[i + 1]);
+            stroke(a, b, wxColour(0, 110, 230), 7);
+            stroke(a, b, col, 3);
+        }
+    }
+
+    // Grips only on the ends that are really loose: a point another wire also
+    // ends on is a corner or a junction, not a handle.
+    dc.SetPen(wxPen(wxColour(0, 90, 200), 1));
+    dc.SetBrush(*wxWHITE_BRUSH);
+    for (const Wire& w : m_circuit->wires)
+    {
+        if (!w.selected || w.points.size() != 2) continue;
+        for (int t = 0; t < 2; ++t)
+        {
+            const wxPoint p = w.points[t];
+            int ends = 0;
+            bool inside = false;
+            for (const Wire& o : m_circuit->wires)
+            {
+                if (o.points.size() != 2) continue;
+                if (o.points[0] == p) ++ends;
+                if (o.points[1] == p) ++ends;
+                if (p != o.points[0] && p != o.points[1] &&
+                    wnPointOnSeg(p, o.points[0], o.points[1])) inside = true;
+            }
+            if (ends > 1 || inside) continue;
+            const wxPoint q = ToPx(p);
+            dc.DrawRectangle(q.x - 3, q.y - 3, 7, 7);
+        }
+    }
+    dc.SetBrush(wxNullBrush);
 }
 
 void CircuitCanvas::DrawJunctions(wxDC& dc)

@@ -170,6 +170,117 @@ static void TestRoute()
     Check(!wnOnWires(wires, P(10, 4)), "orphan check: no wires means no mark");
 }
 
+static bool InsideAnyBlock(const std::vector<wnRect>& blocks, const wxPoint& p)
+{
+    for (size_t i = 0; i < blocks.size(); ++i)
+    {
+        const wnRect& r = blocks[i];
+        if (r.Empty()) continue;
+        if (p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1) return true;
+    }
+    return false;
+}
+
+// Nothing between the two ends of the route may sit on a component body.  The
+// ends themselves are allowed to: that is how a wire reaches a pin, which sits
+// on the edge of the very body it is being kept out of.
+static bool RouteStaysClear(const std::vector<wnRect>& blocks,
+                            const std::vector<wxPoint>& path)
+{
+    if (path.empty()) return false;
+    for (size_t i = 0; i + 1 < path.size(); ++i)
+    {
+        const int dx = (path[i + 1].x > path[i].x) ? 1 : (path[i + 1].x < path[i].x ? -1 : 0);
+        const int dy = (path[i + 1].y > path[i].y) ? 1 : (path[i + 1].y < path[i].y ? -1 : 0);
+        if (dx == 0 && dy == 0) return false;             // a zero length piece
+        wxPoint p = path[i];
+        while (p != path[i + 1])
+        {
+            p = wxPoint(p.x + dx, p.y + dy);
+            if (p == path.front() || p == path.back()) continue;
+            if (InsideAnyBlock(blocks, p)) return false;
+        }
+    }
+    return true;
+}
+
+static void TestRouteAvoid()
+{
+    auto P = [](int x, int y) { return wxPoint(x, y); };
+    auto R = [](int x0, int y0, int x1, int y1)
+    {
+        wnRect r; r.x0 = x0; r.y0 = y0; r.x1 = x1; r.y1 = y1; return r;
+    };
+    std::vector<wxPoint> out, plain;
+
+    // 1. Nothing in the way costs nothing: byte for byte the plain route, so a
+    //    wire drawn on open canvas is never "improved" behind the user's back.
+    std::vector<wnRect> none;
+    wnRoute(P(10, 4), P(24, 9), WN_H, WN_H, plain);
+    wnRouteAvoid(P(10, 4), P(24, 9), WN_H, WN_H, none, out);
+    Check(out == plain, "avoid: an empty canvas routes exactly like wnRoute", Dump(out));
+
+    std::vector<wnRect> farOff;
+    farOff.push_back(R(0, 40, 6, 46));
+    wnRouteAvoid(P(10, 4), P(24, 9), WN_H, WN_H, farOff, out);
+    Check(out == plain, "avoid: a component out of the way is ignored", Dump(out));
+
+    // 2. An output pin feeding an input pin with a component standing in the
+    //    corridor: the straight line would run under the body.
+    std::vector<wnRect> blocks;
+    blocks.push_back(R(8, 0, 12, 4));
+    wnRoute(P(4, 2), P(20, 2), WN_RIGHT, WN_LEFT, plain);
+    wnRouteAvoid(P(4, 2), P(20, 2), WN_RIGHT, WN_LEFT, blocks, out);
+    Check(!RouteStaysClear(blocks, plain),
+          "avoid: the plain route really did cross the body", Dump(plain));
+    Check(Ortho(out) && out.front() == P(4, 2) && out.back() == P(20, 2),
+          "avoid: the detour still joins its two ends", Dump(out));
+    Check(RouteStaysClear(blocks, out), "avoid: the routed run keeps off the body", Dump(out));
+    // The polyline only stores corners, so "leaves to the right" reads as: the
+    // first leg is horizontal and runs east of the pin.
+    Check(out[1].y == 2 && out[1].x > 4,
+          "avoid: it leaves the output pin to the right", Dump(out));
+    Check(out[out.size() - 2] == P(19, 2),
+          "avoid: it reaches the input pin from the left", Dump(out));
+
+    // 3. A wire has to leave a pin on the side the pin faces, and the body
+    //    owning the pin is what makes that unavoidable.
+    std::vector<wnRect> own;
+    own.push_back(R(0, 0, 4, 4));                 // inputs on x=0, outputs on x=4
+    wnRouteAvoid(P(0, 2), P(12, 9), WN_LEFT, WN_ANY, own, out);
+    Check(out[1] == P(-1, 2), "avoid: an input pin is left westwards", Dump(out));
+    Check(RouteStaysClear(own, out),
+          "avoid: and never sneaks along the body edge", Dump(out));
+
+    // 4. The bug that started all this: a component dragged on top of a wire.
+    //    Stretching the wire used to drive it straight through the body; now
+    //    the run steps out of the pin and walks around.
+    std::vector<wnRect> moved;
+    moved.push_back(R(0, 5, 3, 7));               // gate after the drag
+    wnRoute(P(0, 6), P(12, 3), WN_H, WN_ANY, plain);
+    wnRouteAvoid(P(0, 6), P(12, 3), WN_LEFT, WN_ANY, moved, out);
+    Check(!RouteStaysClear(moved, plain),
+          "avoid: the old stretch ran under the body", Dump(plain));
+    Check(out.size() == 4 && out[1] == P(-1, 6) && out[2] == P(-1, 3)
+              && out[3] == P(12, 3),
+          "avoid: out of the pin, up the side, across to the far end", Dump(out));
+    Check(RouteStaysClear(moved, out),
+          "avoid: the repaired wire no longer crosses the body", Dump(out));
+
+    // 5. Degenerate input still behaves.
+    wnRouteAvoid(P(3, 3), P(3, 3), WN_LEFT, WN_RIGHT, blocks, out);
+    Check(out.size() == 1 && out[0] == P(3, 3),
+          "avoid: a zero length run collapses", Dump(out));
+
+    // 6. Walled in on every side: hopeless, but the user still gets a wire --
+    //    one that conducts wrongly beats one that was never created.
+    std::vector<wnRect> wall;
+    wall.push_back(R(-40, -40, 40, 40));
+    wnRouteAvoid(P(0, 0), P(3, 0), WN_RIGHT, WN_LEFT, wall, out);
+    Check(out.size() >= 2 && out.front() == P(0, 0) && out.back() == P(3, 0),
+          "avoid: even a hopeless route still joins the two ends", Dump(out));
+}
+
 static void TestInsertJog()
 {
     std::vector<wxPoint> v;
@@ -487,6 +598,7 @@ int main()
     TestNormalize();
     TestExtendPath();
     TestRoute();
+    TestRouteAvoid();
     TestInsertJog();
     TestNets();
     TestCrossing();
