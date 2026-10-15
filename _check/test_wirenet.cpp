@@ -99,53 +99,75 @@ static void TestExtendPath()
     Check(Ortho(r) && r.back() == P(9, 4), "diagonal jump stays orthogonal", Dump(r));
 }
 
-// Click-to-place wiring: the part a click already fixed must stop following the
-// mouse, while the rubber band behind it keeps growing and shrinking.
-static void TestReplayTrail()
+// Minimal routing: a first-time draw must come out as the shortest clean route,
+// and a deliberate zig-zag must survive untouched.
+static void TestRoute()
 {
     auto P = [](int x, int y) { return wxPoint(x, y); };
     std::vector<wxPoint> out;
 
-    // No click yet: the whole run is live and equals the incremental path.
-    std::vector<wxPoint> live;
-    live.push_back(P(0, 0));
-    wnExtendPath(live, P(5, 0));
-    wnExtendPath(live, P(5, 3));
-    wnExtendPath(live, P(8, 3));
+    // Level ends: one straight segment, whatever the hand did on the way there.
+    wnRoute(P(2, 4), P(20, 4), WN_H, WN_H, out);
+    Check(out.size() == 2 && out[1] == P(20, 4), "route: level ends go straight", Dump(out));
 
-    std::vector<wxPoint> prefix;
-    prefix.push_back(P(0, 0));
-    std::vector<wxPoint> trail;
-    trail.push_back(P(5, 0));
-    trail.push_back(P(5, 3));
-    trail.push_back(P(8, 3));
-    wnReplayTrail(prefix, trail, out);
-    Check(out == live, "trail replay matches the incremental path", Dump(out));
+    // A component pin is met from the side: out, across, in -- never a staircase.
+    wnRoute(P(10, 4), P(24, 9), WN_H, WN_H, out);
+    Check(out.size() == 4 && out[1] == P(17, 4) && out[2] == P(17, 9) && out[3] == P(24, 9),
+          "route: two pins get the Z", Dump(out));
+    Check(Ortho(out), "route: the Z stays orthogonal", Dump(out));
 
-    // One click froze the corner (5,3): the prefix may no longer move, and the
-    // rubber band goes on from there.
-    prefix.push_back(P(5, 0));
-    prefix.push_back(P(5, 3));
-    trail.clear();
-    trail.push_back(P(8, 3));
-    wnReplayTrail(prefix, trail, out);
-    Check(out.size() == 4 && out.back() == P(8, 3), "rubber band continues from the click", Dump(out));
+    // No room for a Z -> the single bend still meets the target level head on.
+    wnRoute(P(10, 4), P(11, 9), WN_H, WN_H, out);
+    Check(out.size() == 3 && out[1] == P(10, 9) && Ortho(out),
+          "route: cramped ends fall back to one bend", Dump(out));
 
-    // Pulling the pointer back retracts only the live part.
-    trail.push_back(P(5, 3));
-    wnReplayTrail(prefix, trail, out);
-    Check(out.size() == 3 && out[2] == P(5, 3), "the frozen corner stays put", Dump(out));
+    // Free end: the source direction decides which bend.
+    wnRoute(P(10, 4), P(24, 9), WN_H, WN_ANY, out);
+    Check(out.size() == 3 && out[1] == P(24, 4) && Ortho(out),
+          "route: a horizontal source leaves horizontally", Dump(out));
+    wnRoute(P(10, 4), P(24, 9), WN_V, WN_ANY, out);
+    Check(out.size() == 3 && out[1] == P(10, 9) && Ortho(out),
+          "route: a vertical source leaves vertically", Dump(out));
 
-    // Moving somewhere else keeps the frozen corner and bends the live tail.
-    trail.push_back(P(2, 3));
-    wnReplayTrail(prefix, trail, out);
-    Check(out.size() == 4 && out[2] == P(5, 3) && out.back() == P(2, 3),
-          "the live tail bends without moving the corner", Dump(out));
+    // Turning back to the left is still handled: one bend, no fold.
+    wnRoute(P(20, 4), P(5, 9), WN_H, WN_H, out);
+    Check(out.size() == 3 && Ortho(out) && out.back() == P(5, 9),
+          "route: a backwards run still gets one bend", Dump(out));
 
-    // An empty trail is just the frozen prefix.
-    trail.clear();
-    wnReplayTrail(prefix, trail, out);
-    Check(out == prefix, "no trail leaves the prefix untouched", Dump(out));
+    // Both ends on the same axis.
+    wnRoute(P(4, 4), P(4, 12), WN_V, WN_V, out);
+    Check(out.size() == 2 && out[1] == P(4, 12), "route: same column goes straight", Dump(out));
+
+    // Collapsed to a single point.
+    wnRoute(P(4, 4), P(4, 4), WN_H, WN_H, out);
+    Check(out.size() == 1, "route: a zero length run collapses", Dump(out));
+
+    Check(wnAxisSide(P(0, 0), P(5, 1)) == WN_H, "axis side: horizontal wins on a tie");
+    Check(wnAxisSide(P(0, 0), P(1, 5)) == WN_V, "axis side: vertical when it dominates");
+
+    // Joining legs: the shared joint is stored once, so a click-to-place run is
+    // a clean polyline and not a pile of repeated points.
+    std::vector<wxPoint> run;
+    run.push_back(P(0, 0));
+    run.push_back(P(6, 0));
+    std::vector<wxPoint> leg;
+    leg.push_back(P(6, 0));
+    leg.push_back(P(6, 4));
+    wnJoinRun(run, leg);
+    Check(run.size() == 3 && run[2] == P(6, 4), "join: the shared joint is not duplicated", Dump(run));
+
+    // A connection mark only counts while a wire runs through it.  This is the
+    // rule that stops a deleted wire from leaving an undying dot behind.
+    std::vector<std::vector<wxPoint>> wires;
+    std::vector<wxPoint> trunk;
+    trunk.push_back(P(2, 4));
+    trunk.push_back(P(20, 4));
+    wires.push_back(trunk);
+    Check(wnOnWires(wires, P(10, 4)),  "orphan check: a point on the wire counts");
+    Check(wnOnWires(wires, P(2, 4)),   "orphan check: an end point counts");
+    Check(!wnOnWires(wires, P(10, 5)), "orphan check: a point beside it does not");
+    wires.clear();
+    Check(!wnOnWires(wires, P(10, 4)), "orphan check: no wires means no mark");
 }
 
 static void TestInsertJog()
@@ -464,7 +486,7 @@ int main()
 {
     TestNormalize();
     TestExtendPath();
-    TestReplayTrail();
+    TestRoute();
     TestInsertJog();
     TestNets();
     TestCrossing();

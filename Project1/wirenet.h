@@ -35,6 +35,11 @@ bool wnAligned(const wxPoint& a, const wxPoint& b);
 // Point lies on an axis aligned segment (endpoints included).
 bool wnPointOnSeg(const wxPoint& p, const wxPoint& a, const wxPoint& b);
 
+// Does any wire still pass through the point?  A connection mark whose wires
+// are gone is rubbish -- it used to be painted forever while refusing to be
+// clicked away, which is exactly why this is a function of its own.
+bool wnOnWires(const std::vector<std::vector<wxPoint>>& polys, const wxPoint& p);
+
 // Remove duplicate points and merge collinear vertices.  The two end points
 // are never removed, so port attachments stay intact.
 void wnNormalize(std::vector<wxPoint>& pts);
@@ -45,17 +50,36 @@ void wnNormalize(std::vector<wxPoint>& pts);
 // path.front() is the fixed start of the run.
 void wnExtendPath(std::vector<wxPoint>& path, const wxPoint& g);
 
-// Rebuild a path from the part a click already fixed (prefix) plus every grid
-// point the pointer has visited since (trail).
+// ---------------------------------------------------------------------------
+// Minimal routing
 //
-// Click-to-place wiring needs exactly this: the prefix must stop following the
-// mouse once the user has clicked, while the trail behind it keeps growing and
-// shrinking with the pointer -- including dropping its corners when the pointer
-// comes back.  Replaying the whole trail instead of just jumping to the newest
-// point is what keeps the geometry identical to the incremental version.
-void wnReplayTrail(const std::vector<wxPoint>& prefix,
-                   const std::vector<wxPoint>& trail,
-                   std::vector<wxPoint>& out);
+// A wire drawn by hand comes back with every accidental kink the hand made.
+// Rather than store the shake, the editor stores the shortest orthogonal route
+// between the two points the user actually cared about; extra bends only ever
+// appear when the user asks for them (click-to-place, "add vertex").
+// ---------------------------------------------------------------------------
+
+// Which axis a route has to use where it meets a point.
+enum wnSide
+{
+    WN_ANY = 0,   // no constraint
+    WN_H,         // must leave / arrive horizontally
+    WN_V          // must leave / arrive vertically
+};
+
+// The axis a route would naturally take from a to b (the dominant offset,
+// ties going horizontal).
+wnSide wnAxisSide(const wxPoint& a, const wxPoint& b);
+
+// Shortest orthogonal route from a to b that respects the two sides.
+// One segment when the points share an axis, one bend otherwise, and the
+// classic "out, across, in" Z when both ends insist on the same axis and there
+// is room for it.  Never a staircase.
+void wnRoute(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
+             std::vector<wxPoint>& out);
+
+// Append a leg to a run, dropping the duplicated joint point.
+void wnJoinRun(std::vector<wxPoint>& run, const std::vector<wxPoint>& leg);
 
 // Insert a stair shaped jog inside one segment ("add vertex").
 bool wnInsertJog(std::vector<wxPoint>& pts, int seg);

@@ -111,7 +111,13 @@ private:
     int    m_wireSrcComp = -1, m_wireSrcPort = -1;
     bool   m_wireSrcIsPort = false;      // path starts on a component port
     bool   m_wireSrcIsOutput = false;
-    std::vector<wxPoint> m_path;         // grid path, front() = start, back() = end
+    // The run in progress.  It is a *routed* polyline, not the raw pointer
+    // trail: every point the user actually committed, plus the shortest clean
+    // route from the last of them to where the pointer is now.  That is what
+    // makes a first-time draw come out straight instead of staircased.
+    std::vector<wxPoint> m_routed;
+    wxPoint m_wireStart;                 // fixed start of the run
+    std::vector<wxPoint> m_wirePrefix;   // corners the user pinned by clicking
     wxPoint m_wireDownPx;
     bool   m_wireDragged = false;
 
@@ -120,10 +126,9 @@ private:
     // every further click pins one more corner, and a click on a port -- or a
     // double click -- finishes it.  Holding the button down and dragging keeps
     // working exactly as before; this is the alternative for long routes where
-    // holding the button the whole way is just painful.
+    // holding the button the whole way is just painful, and it is also how a
+    // deliberate zig-zag is built.
     bool   m_wireSticky = false;
-    std::vector<wxPoint> m_wirePrefix;   // frozen part of a sticky run
-    std::vector<wxPoint> m_pointerTrail; // grid points visited since the freeze
 
     // Where the path would land right now (refreshed on every mouse move).
     wxPoint m_wireTarget;
@@ -205,6 +210,9 @@ private:
     void StartWireAtPoint(const wxPoint& grid, const wxPoint& px);
     void UpdateWireTarget(const wxPoint& px);
     void UpdateWirePath(const wxPoint& g);
+    // Rebuild m_routed from the pinned prefix plus the shortest clean leg to
+    // `target`.
+    void ComputeRouted(const wxPoint& target);
     // The exact geometry FinishWire() would commit right now.  The live preview
     // paints this, so the rubber band never promises something else than what
     // is actually written into the circuit on release.
@@ -220,6 +228,9 @@ private:
     void RepairWiresForMove(const wxPoint& delta);
     void DropDegenerateWires();
     void DeleteWiresOnPorts(const std::vector<wxPoint>& portPts);
+    // Throw away connection marks whose wires are gone, so a deleted wire can
+    // never leave a dot behind that nothing can remove.
+    void PruneJunctions();
 
     wxRect ComputeGridBounds() const;
     wxRect ComputeContentBoundsPx() const;

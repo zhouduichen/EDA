@@ -129,7 +129,9 @@ void CircuitCanvas::SetCircuit(Circuit* c)
     if (m_drawingWire && HasCapture()) ReleaseMouse();
     m_circuit = c;
     m_drawingWire = false;
-    m_path.clear();
+    m_wireSticky = false;
+    m_wirePrefix.clear();
+    m_routed.clear();
     m_moving = m_movingWire = m_wireBranchPending = m_rubberBanding = m_panning = false;
     m_dragWireIndex = -1;
     m_undo.clear();
@@ -391,13 +393,13 @@ void CircuitCanvas::StartWire(int compId, int portIdx, const wxPoint& px)
     m_drawingWire      = true;
     m_wireSticky       = false;
     m_wirePrefix.clear();
-    m_pointerTrail.clear();
     m_wireSrcComp      = compId;
     m_wireSrcPort      = portIdx;
     m_wireSrcIsPort    = true;
     m_wireSrcIsOutput  = p->isOutput;
-    m_path.clear();
-    m_path.push_back(p->grid);
+    m_wireStart        = p->grid;
+    m_routed.clear();
+    m_routed.push_back(p->grid);
     m_wireDownPx       = px;
     m_wireDragged      = false;
     m_wireTarget       = p->grid;
@@ -419,13 +421,13 @@ void CircuitCanvas::StartWireAtPoint(const wxPoint& grid, const wxPoint& px)
     m_drawingWire      = true;
     m_wireSticky       = false;
     m_wirePrefix.clear();
-    m_pointerTrail.clear();
     m_wireSrcComp      = -1;
     m_wireSrcPort      = -1;
     m_wireSrcIsPort    = false;
     m_wireSrcIsOutput  = false;
-    m_path.clear();
-    m_path.push_back(grid);
+    m_wireStart        = grid;
+    m_routed.clear();
+    m_routed.push_back(grid);
     m_wireDownPx       = px;
     m_wireDragged      = false;
     m_wireTarget       = grid;
@@ -536,30 +538,35 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
     hint();
 }
 
-// Logisim WiringTool: the drawn path simply follows the pointer.
+// The drawn run follows the pointer, but only ever as the shortest clean route
+// from the last point the user committed to where the pointer is now.
 //
-// In a sticky run the path is rebuilt from the frozen prefix plus every grid
-// point the pointer has visited since the last click.  Replaying the whole
-// trail -- rather than just jumping to the newest point -- is what keeps the
-// corner the user just clicked pinned where they put it while the rubber band
-// goes on from there.
+// The raw pointer trail is deliberately *not* what gets stored: a hand shaking
+// while dragging used to leave a staircase in the circuit for good.  Extra
+// bends are available on purpose instead -- click-to-place pins one, and
+// "add vertex" inserts one afterwards.
 void CircuitCanvas::UpdateWirePath(const wxPoint& g)
 {
-    if (!m_wireSticky) { wnExtendPath(m_path, g); return; }
+    ComputeRouted(g);
+}
 
-    if (m_pointerTrail.empty() || m_pointerTrail.back() != g)
-        m_pointerTrail.push_back(g);
+void CircuitCanvas::ComputeRouted(const wxPoint& target)
+{
+    m_routed = m_wirePrefix;
+    if (m_routed.empty()) m_routed.push_back(m_wireStart);
 
-    // A very long trail costs nothing to replay, but freezing it keeps the
-    // per-move work bounded on a slow machine.
-    if (m_pointerTrail.size() > 512)
-    {
-        m_wirePrefix = m_path;
-        m_pointerTrail.clear();
-        m_pointerTrail.push_back(g);
-    }
+    const wxPoint from = m_routed.back();
 
-    wnReplayTrail(m_wirePrefix, m_pointerTrail, m_path);
+    // A component pin is always met from the side (every component here has its
+    // pins on the left / right edge); anywhere else the pull direction decides.
+    wnSide aSide = WN_H;
+    if (!m_wireSrcIsPort || m_routed.size() > 1)
+        aSide = wnAxisSide(from, target);
+    const wnSide bSide = m_wireTargetOnPort ? WN_H : WN_ANY;
+
+    std::vector<wxPoint> leg;
+    wnRoute(from, target, aSide, bSide, leg);
+    wnJoinRun(m_routed, leg);
 }
 
 // The geometry that FinishWire() is about to write into the circuit.
@@ -570,7 +577,7 @@ void CircuitCanvas::UpdateWirePath(const wxPoint& g)
 // would show a connection that does not exist.  One function, one answer.
 std::vector<wxPoint> CircuitCanvas::BuildCommitPath() const
 {
-    std::vector<wxPoint> pts = m_path;
+    std::vector<wxPoint> pts = m_routed;
     wnNormalize(pts);
     if (!m_circuit || pts.size() < 2) return pts;
 
@@ -601,8 +608,8 @@ std::vector<wxPoint> CircuitCanvas::BuildCommitPath() const
 
 void CircuitCanvas::FinishWire()
 {
-    if (!m_circuit || !m_drawingWire || m_path.size() < 2) { CancelWire(); return; }
-    if (m_path.front() == m_path.back()) { CancelWire(); return; }
+    if (!m_circuit || !m_drawingWire || m_routed.size() < 2) { CancelWire(); return; }
+    if (m_routed.front() == m_routed.back()) { CancelWire(); return; }
 
     // Validate the port we are about to land on.
     int dstComp = -1, dstPort = -1;
@@ -711,7 +718,7 @@ void CircuitCanvas::CancelWire()
     m_wireDragged      = false;
     m_wireSticky       = false;
     m_wirePrefix.clear();
-    m_pointerTrail.clear();
+    m_routed.clear();
     m_wireSrcComp      = -1;
     m_wireSrcPort      = -1;
     m_wireSrcIsPort    = false;
@@ -721,7 +728,6 @@ void CircuitCanvas::CancelWire()
     m_wireTargetComp   = -1;
     m_wireTargetPort   = -1;
     m_wireTargetWire   = -1;
-    m_path.clear();
     if (HasCapture()) ReleaseMouse();
     Refresh();
 }
@@ -824,6 +830,14 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
     std::vector<Wire> out;
     out.reserve(m_wireSnapshot.size() * 2 + 4);
 
+    // How many segments each run has.  Re-routing a single straight run is
+    // safe; a run the user built out of several segments (a deliberate
+    // zig-zag) must only be stretched, or the new shape would disagree with
+    // the pieces around it.
+    std::map<int, int> runSize;
+    for (const Wire& w : m_wireSnapshot)
+        if (w.points.size() == 2) runSize[w.group]++;
+
     for (const Wire& w : m_wireSnapshot)
     {
         if (w.points.size() != 2) continue;
@@ -831,6 +845,33 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
         int aComp = -1, aPort = -1, bComp = -1, bPort = -1;
         const wxPoint na = resolveEnd(w, w.points[0], w.srcComp, w.srcPort, aComp, aPort);
         const wxPoint nb = resolveEnd(w, w.points[1], w.dstComp, w.dstPort, bComp, bPort);
+
+        // A wire nothing happened to keeps the shape the user gave it, bends
+        // and all.  Only the ones that really moved get re-laid.
+        if (na == w.points[0] && nb == w.points[1]) { pushUnique(out, w); continue; }
+
+        // An end that is glued to a component pin has to keep meeting it from
+        // the side, so the whole run becomes the shortest route that can do
+        // that.  Without this the bend landed hard against the pin and the wire
+        // left a gate's output going straight down.
+        if ((aComp >= 0 || bComp >= 0) && runSize[w.group] == 1)
+        {
+            std::vector<wxPoint> route;
+            wnRoute(na, nb, aComp >= 0 ? WN_H : WN_ANY, bComp >= 0 ? WN_H : WN_ANY, route);
+
+            for (size_t k = 0; k + 1 < route.size(); ++k)
+            {
+                Wire nw = w;
+                nw.points.clear();
+                nw.points.push_back(route[k]);
+                nw.points.push_back(route[k + 1]);
+                nw.srcComp = nw.srcPort = nw.dstComp = nw.dstPort = -1;
+                if (k == 0)                 { nw.srcComp = aComp; nw.srcPort = aPort; }
+                if (k + 2 == route.size())  { nw.dstComp = bComp; nw.dstPort = bPort; }
+                pushUnique(out, nw);
+            }
+            continue;
+        }
 
         const std::vector<wnRelocPiece> pieces = wnRelocate(w.points[0], w.points[1], na, nb);
 
@@ -861,6 +902,8 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
         if (w.srcComp < 0) BindEndToPort(w, true);
         if (w.dstComp < 0) BindEndToPort(w, false);
     }
+
+    PruneJunctions();
 }
 
 void CircuitCanvas::DropDegenerateWires()
@@ -870,6 +913,26 @@ void CircuitCanvas::DropDegenerateWires()
         std::remove_if(m_circuit->wires.begin(), m_circuit->wires.end(),
                        [](const Wire& w) { return w.points.size() < 2; }),
         m_circuit->wires.end());
+    PruneJunctions();
+}
+
+// A connection mark only means something while a wire runs through it.  Once
+// the wire is gone the mark is invisible rubbish that used to be impossible to
+// get rid of: it was still painted, but clicking it demanded a wire to stand
+// on, which by then did not exist any more.
+void CircuitCanvas::PruneJunctions()
+{
+    if (!m_circuit || m_circuit->junctions.empty()) return;
+
+    std::vector<std::vector<wxPoint>> polys;
+    polys.reserve(m_circuit->wires.size());
+    for (const Wire& w : m_circuit->wires)
+        if (w.points.size() == 2) polys.push_back(w.points);
+
+    m_circuit->junctions.erase(
+        std::remove_if(m_circuit->junctions.begin(), m_circuit->junctions.end(),
+                       [&](const wxPoint& g) { return !wnOnWires(polys, g); }),
+        m_circuit->junctions.end());
 }
 
 // Remove every wire segment that touches one of the given port locations.
@@ -1054,8 +1117,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
 
             // Pin the corner: what has been drawn so far stops following the
             // mouse and the rubber band continues from here.
-            m_wirePrefix = m_path;
-            m_pointerTrail.clear();
+            m_wirePrefix = m_routed;
             Refresh();
             return;
         }
@@ -1163,8 +1225,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
                 // throwing it away, so long routes can be placed click by
                 // click with no button held.
                 m_wireSticky = true;
-                m_wirePrefix = m_path;
-                m_pointerTrail.clear();
+                m_wirePrefix = m_routed;
                 // The button is up now, so the mouse must go back to the rest
                 // of the application even though the run is still alive.
                 if (HasCapture()) ReleaseMouse();
@@ -1460,30 +1521,61 @@ void CircuitCanvas::OnWireEndDrag(const wxMouseEvent& e)
     const int aComp = w.srcComp, aPort = w.srcPort;
     const int bComp = w.dstComp, bPort = w.dstPort;
 
-    const std::vector<wnRelocPiece> pieces = wnRelocate(oldA, oldB, newA, newB);
-    if (pieces.empty()) return;
+    // The end that stays put decides the shape: when it is a component pin the
+    // run has to leave it from the side, so it is routed rather than merely
+    // bent.  Between two free ends the old rule stands -- the grabbed end keeps
+    // the direction the wire used to have, which makes the drag predictable.
+    const int fixedComp = m_endAtStart ? bComp : aComp;
+    const int fixedPort = m_endAtStart ? bPort : aPort;
+    const wxPoint fixed = m_endAtStart ? newB : newA;
+    const bool  targetOnPort = (compId >= 0);
+
+    std::vector<wxPoint> route;
+    if (fixedComp >= 0)
+        wnRoute(fixed, target, WN_H, targetOnPort ? WN_H : WN_ANY, route);
 
     std::vector<Wire> out;
-    for (size_t k = 0; k < pieces.size(); ++k)
+    if (!route.empty())
     {
-        Wire nw;
-        nw.group    = w.group;
-        // Deliberately keep the selection state: the wire stays "not selected",
-        // so grabbing its end a second time stretches it again instead of
-        // suddenly turning into a whole-run move.
-        nw.selected = w.selected;
-        nw.points.push_back(pieces[k].a);
-        nw.points.push_back(pieces[k].b);
-
-        auto bind = [&](int src, int& comp, int& port)
+        for (size_t k = 0; k + 1 < route.size(); ++k)
         {
-            if      (src == 0) { comp = aComp; port = aPort; }
-            else if (src == 1) { comp = bComp; port = bPort; }
-            else               { comp = -1;    port = -1;    }   // inserted jog
-        };
-        bind(pieces[k].srcA, nw.srcComp, nw.srcPort);
-        bind(pieces[k].srcB, nw.dstComp, nw.dstPort);
-        out.push_back(nw);
+            Wire nw;
+            nw.group    = w.group;
+            nw.selected = w.selected;
+            nw.points.push_back(route[k]);
+            nw.points.push_back(route[k + 1]);
+            nw.srcComp = nw.srcPort = nw.dstComp = nw.dstPort = -1;
+            if (k == 0)                { nw.srcComp = fixedComp; nw.srcPort = fixedPort; }
+            if (k + 2 == route.size()) { nw.dstComp = compId;    nw.dstPort = portIdx; }
+            out.push_back(nw);
+        }
+    }
+    else
+    {
+        const std::vector<wnRelocPiece> pieces = wnRelocate(oldA, oldB, newA, newB);
+        if (pieces.empty()) return;
+
+        for (size_t k = 0; k < pieces.size(); ++k)
+        {
+            Wire nw;
+            nw.group    = w.group;
+            // Deliberately keep the selection state: the wire stays "not
+            // selected", so grabbing its end a second time stretches it again
+            // instead of suddenly turning into a whole-run move.
+            nw.selected = w.selected;
+            nw.points.push_back(pieces[k].a);
+            nw.points.push_back(pieces[k].b);
+
+            auto bind = [&](int src, int& comp, int& port)
+            {
+                if      (src == 0) { comp = aComp; port = aPort; }
+                else if (src == 1) { comp = bComp; port = bPort; }
+                else               { comp = -1;    port = -1;    }   // inserted jog
+            };
+            bind(pieces[k].srcA, nw.srcComp, nw.srcPort);
+            bind(pieces[k].srcB, nw.dstComp, nw.dstPort);
+            out.push_back(nw);
+        }
     }
 
     m_circuit->wires.erase(m_circuit->wires.begin() + m_endWireIndex);
@@ -1496,6 +1588,7 @@ void CircuitCanvas::OnWireEndDrag(const wxMouseEvent& e)
         if (q.dstComp < 0) BindEndToPort(q, false);
     }
 
+    PruneJunctions();
     DoEvaluate();
     Refresh();
 }
@@ -1581,16 +1674,13 @@ void CircuitCanvas::ToggleJunction(const wxPoint& px)
         if (w.points.size() != 2) continue;
         if (wnPointOnSeg(g, w.points[0], w.points[1])) { onWire = true; break; }
     }
-    if (!onWire)
-    {
-        Status(wxT("连接点必须放在导线上"));
-        return;
-    }
 
-    SnapshotForUndo();
+    // An existing mark can always be taken away, even one whose wire has gone:
+    // otherwise it would sit there forever, drawn but untouchable.
     for (size_t i = 0; i < m_circuit->junctions.size(); ++i)
     {
         if (m_circuit->junctions[i] != g) continue;
+        SnapshotForUndo();
         m_circuit->junctions.erase(m_circuit->junctions.begin() + i);
         Status(wxT("已取消该连接点"));
         DoEvaluate();
@@ -1598,6 +1688,13 @@ void CircuitCanvas::ToggleJunction(const wxPoint& px)
         return;
     }
 
+    if (!onWire)
+    {
+        Status(wxT("连接点必须放在导线上"));
+        return;
+    }
+
+    SnapshotForUndo();
     m_circuit->junctions.push_back(g);
     Status(wxT("已添加连接点：此处导线互相连通"));
     DoEvaluate();
@@ -1698,6 +1795,7 @@ void CircuitCanvas::DeleteSelection()
     comps.erase(std::remove_if(comps.begin(), comps.end(),
         [](const Component& c) { return c.selected; }), comps.end());
 
+    PruneJunctions();
     DoEvaluate();
     Refresh();
     NotifySelectionChanged();
@@ -1894,6 +1992,7 @@ void CircuitCanvas::AddVertexToSelectedWire()
     it = m_circuit->wires.erase(it);
     m_circuit->wires.insert(it, add.begin(), add.end());
 
+    PruneJunctions();
     DoEvaluate();
     Refresh();
 }
@@ -1952,6 +2051,7 @@ void CircuitCanvas::RemoveVertexFromSelectedWire()
             m_circuit->wires.erase(m_circuit->wires.begin() + a);
             m_circuit->wires.push_back(merged);
 
+            PruneJunctions();
             DoEvaluate();
             Refresh();
             return;
@@ -2221,8 +2321,13 @@ void CircuitCanvas::DrawJunctions(wxDC& dc)
             wnBuildNets(polys, std::vector<wxPoint>(), m_circuit->junctions);
         for (const wnNet& net : nets)
             m_junctions.insert(m_junctions.end(), net.junctions.begin(), net.junctions.end());
+        // Marks the user placed by hand, but only while a wire still runs
+        // through them: a mark on empty canvas is invisible rubbish that cannot
+        // be clicked away.
         for (const wxPoint& p : m_circuit->junctions)
         {
+            if (!wnOnWires(polys, p)) continue;
+
             bool known = false;
             for (const wxPoint& q : m_junctions) if (q == p) { known = true; break; }
             if (!known) m_junctions.push_back(p);

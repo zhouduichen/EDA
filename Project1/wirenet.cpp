@@ -142,6 +142,17 @@ bool wnPointOnSeg(const wxPoint& p, const wxPoint& a, const wxPoint& b)
     return false;
 }
 
+bool wnOnWires(const std::vector<std::vector<wxPoint>>& polys, const wxPoint& p)
+{
+    for (size_t i = 0; i < polys.size(); ++i)
+    {
+        const std::vector<wxPoint>& poly = polys[i];
+        for (size_t j = 0; j + 1 < poly.size(); ++j)
+            if (wnPointOnSeg(p, poly[j], poly[j + 1])) return true;
+    }
+    return false;
+}
+
 void wnNormalize(std::vector<wxPoint>& pts)
 {
     bool changed = true;
@@ -219,14 +230,62 @@ void wnExtendPath(std::vector<wxPoint>& path, const wxPoint& g)
     path.push_back(g);
 }
 
-// Replay a frozen prefix plus the pointer trail into a path.
-void wnReplayTrail(const std::vector<wxPoint>& prefix,
-                   const std::vector<wxPoint>& trail,
-                   std::vector<wxPoint>& out)
+// ---------------------------------------------------------------------------
+// Minimal routing
+// ---------------------------------------------------------------------------
+
+wnSide wnAxisSide(const wxPoint& a, const wxPoint& b)
 {
-    out = prefix;
-    if (out.empty()) return;
-    for (size_t i = 0; i < trail.size(); ++i) wnExtendPath(out, trail[i]);
+    const int dx = std::abs(b.x - a.x);
+    const int dy = std::abs(b.y - a.y);
+    return (dx >= dy) ? WN_H : WN_V;
+}
+
+void wnRoute(const wxPoint& a, const wxPoint& b, wnSide aSide, wnSide bSide,
+             std::vector<wxPoint>& out)
+{
+    out.clear();
+    out.push_back(a);
+    if (a == b) return;
+
+    // Sharing an axis always wins: one straight segment, nothing else to say.
+    if (a.x == b.x || a.y == b.y) { out.push_back(b); return; }
+
+    // Both ends want the same axis.  A single bend cannot satisfy that, so the
+    // route goes out, across and back in again -- the classic Z.  It needs room
+    // on the axis, otherwise the single bend below has to do.
+    if (aSide == WN_H && bSide == WN_H && b.x - a.x >= 3)
+    {
+        const int mx = a.x + (b.x - a.x) / 2;
+        out.push_back(wxPoint(mx, a.y));
+        out.push_back(wxPoint(mx, b.y));
+        out.push_back(b);
+        return;
+    }
+    if (aSide == WN_V && bSide == WN_V && b.y - a.y >= 3)
+    {
+        const int my = a.y + (b.y - a.y) / 2;
+        out.push_back(wxPoint(a.x, my));
+        out.push_back(wxPoint(b.x, my));
+        out.push_back(b);
+        return;
+    }
+
+    // One bend.  The arrival matters most, so the target side picks the corner;
+    // a target that does not care falls in line with the source.
+    bool cornerAtTargetX = (bSide == WN_V);
+    if (bSide == WN_ANY) cornerAtTargetX = (aSide == WN_H);
+    out.push_back(cornerAtTargetX ? wxPoint(b.x, a.y) : wxPoint(a.x, b.y));
+    out.push_back(b);
+}
+
+void wnJoinRun(std::vector<wxPoint>& run, const std::vector<wxPoint>& leg)
+{
+    for (size_t i = 0; i < leg.size(); ++i)
+    {
+        if (!run.empty() && run.back() == leg[i]) continue;   // shared joint
+        run.push_back(leg[i]);
+    }
 }
 
 bool wnInsertJog(std::vector<wxPoint>& pts, int seg)
