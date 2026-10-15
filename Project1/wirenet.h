@@ -45,6 +45,18 @@ void wnNormalize(std::vector<wxPoint>& pts);
 // path.front() is the fixed start of the run.
 void wnExtendPath(std::vector<wxPoint>& path, const wxPoint& g);
 
+// Rebuild a path from the part a click already fixed (prefix) plus every grid
+// point the pointer has visited since (trail).
+//
+// Click-to-place wiring needs exactly this: the prefix must stop following the
+// mouse once the user has clicked, while the trail behind it keeps growing and
+// shrinking with the pointer -- including dropping its corners when the pointer
+// comes back.  Replaying the whole trail instead of just jumping to the newest
+// point is what keeps the geometry identical to the incremental version.
+void wnReplayTrail(const std::vector<wxPoint>& prefix,
+                   const std::vector<wxPoint>& trail,
+                   std::vector<wxPoint>& out);
+
 // Insert a stair shaped jog inside one segment ("add vertex").
 bool wnInsertJog(std::vector<wxPoint>& pts, int seg);
 

@@ -115,6 +115,13 @@ CircuitCanvas::CircuitCanvas(wxWindow* parent)
     Bind(wxEVT_MOUSEWHEEL,       &CircuitCanvas::OnMouseWheel, this);
     Bind(wxEVT_KEY_DOWN,         &CircuitCanvas::OnKey, this);
     Bind(wxEVT_CHAR,             &CircuitCanvas::OnKey, this);
+    // The hover highlight on connection points has to go away with the mouse.
+    Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e)
+    {
+        m_hasMouse = false;
+        Refresh();
+        e.Skip();
+    });
 }
 
 void CircuitCanvas::SetCircuit(Circuit* c)
@@ -382,6 +389,9 @@ void CircuitCanvas::StartWire(int compId, int portIdx, const wxPoint& px)
     if (!p) return;
 
     m_drawingWire      = true;
+    m_wireSticky       = false;
+    m_wirePrefix.clear();
+    m_pointerTrail.clear();
     m_wireSrcComp      = compId;
     m_wireSrcPort      = portIdx;
     m_wireSrcIsPort    = true;
@@ -398,7 +408,7 @@ void CircuitCanvas::StartWire(int compId, int portIdx, const wxPoint& px)
     m_wireTargetWire   = -1;
 
     if (!HasCapture()) CaptureMouse();
-    Status(wxT("连线：按住左键拖动到目标端口 / 导线后松开，右键或 Esc 取消"));
+    Status(wxT("连线：按住左键拖动到目标端口 / 导线后松开，右键或 Esc 取消；也可以直接松开左键逐点点击布线"));
     Refresh();
 }
 
@@ -407,6 +417,9 @@ void CircuitCanvas::StartWireAtPoint(const wxPoint& grid, const wxPoint& px)
     if (!m_circuit) return;
 
     m_drawingWire      = true;
+    m_wireSticky       = false;
+    m_wirePrefix.clear();
+    m_pointerTrail.clear();
     m_wireSrcComp      = -1;
     m_wireSrcPort      = -1;
     m_wireSrcIsPort    = false;
@@ -438,6 +451,31 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
     m_wireTargetWire   = -1;
     m_wireTarget       = ToGrid(px);
 
+    // Say out loud what a release would do right now.  Without this the user
+    // has to guess whether the wire is about to land on the pin or one grid
+    // step beside it.
+    auto hint = [&]()
+    {
+        if (m_wireTargetOnPort)
+        {
+            const Component* c = m_circuit->FindComponent(m_wireTargetComp);
+            const Port* p = m_circuit->FindPort(m_wireTargetComp, m_wireTargetPort);
+            if (c && p)
+            {
+                wxString what = TypeName(c->type);
+                if (c->type == CT_SubCircuit && !c->subName.IsEmpty()) what = c->subName;
+                Status(wxString::Format(wxT("松开即接入 %s 的%s引脚 #%d"),
+                       what, p->isOutput ? wxT("输出") : wxT("输入"),
+                       m_wireTargetPort + 1));
+                return;
+            }
+        }
+        if (m_wireTargetOnWire)
+            Status(wxT("松开即在这条导线上创建一个分支点"));
+        else
+            Status(wxT("松开即落线；拖动到引脚 / 导线上会自动吸附，右键或 Esc 取消"));
+    };
+
     // A port wins over everything else.
     int compId = -1, portIdx = -1;
     if (FindPortAt(px, compId, portIdx))
@@ -451,6 +489,7 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
                 m_wireTargetOnPort = true;
                 m_wireTargetComp   = compId;
                 m_wireTargetPort   = portIdx;
+                hint();
                 return;
             }
         }
@@ -480,7 +519,7 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
                 m_wireTargetPort   = (int)i;
             }
         }
-        if (m_wireTargetOnPort) return;
+        if (m_wireTargetOnPort) { hint(); return; }
     }
 
     // Otherwise snap onto an existing wire so a junction is created.
@@ -493,12 +532,71 @@ void CircuitCanvas::UpdateWireTarget(const wxPoint& px)
         m_wireTargetOnWire = true;
         m_wireTargetWire   = wi;
     }
+
+    hint();
 }
 
 // Logisim WiringTool: the drawn path simply follows the pointer.
+//
+// In a sticky run the path is rebuilt from the frozen prefix plus every grid
+// point the pointer has visited since the last click.  Replaying the whole
+// trail -- rather than just jumping to the newest point -- is what keeps the
+// corner the user just clicked pinned where they put it while the rubber band
+// goes on from there.
 void CircuitCanvas::UpdateWirePath(const wxPoint& g)
 {
-    wnExtendPath(m_path, g);
+    if (!m_wireSticky) { wnExtendPath(m_path, g); return; }
+
+    if (m_pointerTrail.empty() || m_pointerTrail.back() != g)
+        m_pointerTrail.push_back(g);
+
+    // A very long trail costs nothing to replay, but freezing it keeps the
+    // per-move work bounded on a slow machine.
+    if (m_pointerTrail.size() > 512)
+    {
+        m_wirePrefix = m_path;
+        m_pointerTrail.clear();
+        m_pointerTrail.push_back(g);
+    }
+
+    wnReplayTrail(m_wirePrefix, m_pointerTrail, m_path);
+}
+
+// The geometry that FinishWire() is about to write into the circuit.
+//
+// The preview and the commit both go through here on purpose.  A wire records
+// which port it is plugged into, but the netlist is built from the drawn
+// geometry alone -- so a preview that stopped one grid step short of the port
+// would show a connection that does not exist.  One function, one answer.
+std::vector<wxPoint> CircuitCanvas::BuildCommitPath() const
+{
+    std::vector<wxPoint> pts = m_path;
+    wnNormalize(pts);
+    if (!m_circuit || pts.size() < 2) return pts;
+
+    if (m_wireTargetOnPort)
+    {
+        const Port* tp = m_circuit->FindPort(m_wireTargetComp, m_wireTargetPort);
+        if (tp && pts.back() != tp->grid)
+        {
+            const wxPoint g   = tp->grid;
+            const wxPoint lst = pts.back();
+            const wxPoint prv = pts[pts.size() - 2];
+            if (wnAligned(prv, g))
+            {
+                pts.back() = g;                       // still one straight leg
+            }
+            else
+            {
+                const wxPoint c = (prv.y == lst.y) ? wxPoint(lst.x, g.y)
+                                                  : wxPoint(g.x, lst.y);
+                if (c != lst && c != g) pts.push_back(c);
+                pts.push_back(g);
+            }
+        }
+    }
+    wnNormalize(pts);
+    return pts;
 }
 
 void CircuitCanvas::FinishWire()
@@ -530,36 +628,10 @@ void CircuitCanvas::FinishWire()
         dstPort = m_wireTargetPort;
     }
 
-    std::vector<wxPoint> pts = m_path;
-    wnNormalize(pts);
-    if (pts.size() < 2 || pts.front() == pts.back()) { CancelWire(); return; }
-
-    // Belt and braces.  A wire records *which* port it is plugged into, but the
-    // netlist is built from the drawn geometry alone -- so an end that is even
-    // one grid step short of the port it claims would be silently open.  Make
-    // the geometry actually reach the port, bending the last leg if needed.
-    if (dstComp >= 0)
-    {
-        const Port* tp = m_circuit->FindPort(dstComp, dstPort);
-        if (tp && pts.back() != tp->grid)
-        {
-            const wxPoint g   = tp->grid;
-            const wxPoint lst = pts[pts.size() - 1];
-            const wxPoint prv = pts[pts.size() - 2];
-            if (wnAligned(prv, g))
-            {
-                pts.back() = g;                       // still one straight leg
-            }
-            else
-            {
-                const wxPoint c = (prv.y == lst.y) ? wxPoint(lst.x, g.y)
-                                                   : wxPoint(g.x, lst.y);
-                if (c != lst && c != g) pts.push_back(c);
-                pts.push_back(g);
-            }
-        }
-    }
-    wnNormalize(pts);
+    // Belt and braces.  FinishWire() validates the port above, and the shared
+    // path builder already bent the last leg onto it -- whatever is committed
+    // here is byte for byte what the user saw while dragging.
+    std::vector<wxPoint> pts = BuildCommitPath();
     if (pts.size() < 2 || pts.front() == pts.back()) { CancelWire(); return; }
 
     SnapshotForUndo();
@@ -637,6 +709,9 @@ void CircuitCanvas::CancelWire()
 {
     m_drawingWire      = false;
     m_wireDragged      = false;
+    m_wireSticky       = false;
+    m_wirePrefix.clear();
+    m_pointerTrail.clear();
     m_wireSrcComp      = -1;
     m_wireSrcPort      = -1;
     m_wireSrcIsPort    = false;
@@ -936,6 +1011,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
     wxPoint px = e.GetPosition();
     wxPoint grid = ToGrid(px);
     m_curGrid = grid;
+    m_curPx   = px;
     m_hasMouse = true;
 
     // Panning with the middle mouse button.
@@ -966,8 +1042,21 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
         SetFocusIgnoringChildren();
         if (m_drawingWire)
         {
-            // The button is already down while drawing, so a second press is
-            // not part of the Logisim wiring flow -- ignore it.
+            // A second press while the button is still down is not part of the
+            // Logisim wiring flow -- ignore it.  During a click-to-place run it
+            // is the opposite: every click pins a corner or finishes the run.
+            if (!m_wireSticky) return;
+
+            UpdateWireTarget(px);
+            UpdateWirePath(m_wireTarget);
+
+            if (m_wireTargetOnPort) { FinishWire(); return; }
+
+            // Pin the corner: what has been drawn so far stops following the
+            // mouse and the rubber band continues from here.
+            m_wirePrefix = m_path;
+            m_pointerTrail.clear();
+            Refresh();
             return;
         }
         switch (m_tool)
@@ -1015,6 +1104,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
             return;
         }
         if (m_movingWire) { OnWireMoveDrag(e); return; }
+        if (m_draggingEnd) { OnWireEndDrag(e); return; }
         if (m_moving) { OnMoveDrag(e); return; }
         if (m_rubberBanding)
         {
@@ -1053,17 +1143,63 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
         }
         if (m_drawingWire)
         {
-            // Logisim: releasing without having dragged creates nothing.
-            // The path has to be extended one last time: the last motion event
-            // can be a whole grid step away from where the button came up, and
-            // the net extraction is purely geometric.
+            // A click-to-place run never ends on the button release: the click
+            // either pinned a corner (handled on the way down) or started one.
+            if (m_wireSticky) return;
+
+            // Logisim: releasing without having dragged creates nothing.  The
+            // path has to be extended one last time: the last motion event can
+            // be a whole grid step away from where the button came up, and the
+            // net extraction is purely geometric.
             if (m_wireDragged)
             {
                 UpdateWireTarget(px);
                 UpdateWirePath(m_wireTarget);
                 FinishWire();
             }
+            else if (m_wireSrcIsPort)
+            {
+                // A plain click on a port keeps the run alive instead of
+                // throwing it away, so long routes can be placed click by
+                // click with no button held.
+                m_wireSticky = true;
+                m_wirePrefix = m_path;
+                m_pointerTrail.clear();
+                // The button is up now, so the mouse must go back to the rest
+                // of the application even though the run is still alive.
+                if (HasCapture()) ReleaseMouse();
+                Status(wxT("点击放置拐点；点到引脚上完成，双击完成，右键或 Esc 取消"));
+                Refresh();
+            }
             else               { CancelWire(); }
+            return;
+        }
+        if (m_draggingEnd)
+        {
+            m_draggingEnd = false;
+            if (HasCapture()) ReleaseMouse();
+
+            if (!m_endMoveSnapshotted)
+            {
+                // Released without moving: a plain click still selects the
+                // segment, exactly like clicking any other wire.
+                ClearSelection();
+                if (m_endWireIndex >= 0 && m_endWireIndex < (int)m_circuit->wires.size())
+                {
+                    m_circuit->wires[m_endWireIndex].selected = true;
+                    Status(wxT("已选中导线段：再次按下并拖动可移动，Delete 删除"));
+                }
+            }
+            else
+            {
+                DropDegenerateWires();
+            }
+
+            m_endWireIndex       = -1;
+            m_endMoveSnapshotted = false;
+            DoEvaluate();
+            NotifySelectionChanged();
+            Refresh();
             return;
         }
         if (m_movingWire)
@@ -1162,14 +1298,28 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
     int wireIndex = HitWire(px, wireSegment, wireSnap);
     if (wireIndex >= 0)
     {
-        // Grabbing a loose end starts the branch from that exact end.
+        // Grabbing a loose end of an existing wire stretches that very wire.
         int freeIdx = -1;
         wxPoint freeEnd;
-        if (FindFreeWireEnd(px, freeIdx, freeEnd) && freeIdx == wireIndex)
-            wireSnap = freeEnd;
+        const bool onFreeEnd =
+            FindFreeWireEnd(px, freeIdx, freeEnd) && freeIdx == wireIndex;
+        if (onFreeEnd) wireSnap = freeEnd;
 
         const bool wasSelected = m_circuit->wires[wireIndex].selected;
         const bool forceBranch = e.ControlDown() || e.AltDown();
+
+        if (onFreeEnd && !wasSelected && !forceBranch)
+        {
+            m_draggingEnd          = true;
+            m_endWireIndex         = wireIndex;
+            m_endAtStart           = (m_circuit->wires[wireIndex].points.front() == freeEnd);
+            m_endMoveSnapshotted   = false;
+            SnapshotWiresAndPorts();
+            CaptureMouse();
+            Status(wxT("拖动端点：拉长 / 缩短 / 转向这条导线；Ctrl+拖动可改为分叉新线"));
+            Refresh();
+            return;
+        }
 
         // Not selected yet (or Ctrl/Alt): the press is "pending".  Drag ->
         // branch a new wire out of this point, release -> select the segment.
@@ -1261,6 +1411,95 @@ void CircuitCanvas::OnWireMoveDrag(const wxMouseEvent& e)
     Refresh();
 }
 
+// Drag the loose end of one wire.  The far end stays where it is, the segment
+// is re-laid so it still runs horizontally / vertically (turning a corner
+// splits it in two), and any end point that used to sit inside the segment
+// travels along with it.  Everything is rebuilt from the press-time snapshot,
+// so pulling back and forth never piles up jogs.
+void CircuitCanvas::OnWireEndDrag(const wxMouseEvent& e)
+{
+    if (!m_circuit || !m_draggingEnd) return;
+    if (m_endWireIndex < 0 || m_endWireIndex >= (int)m_wireSnapshot.size()) return;
+
+    const wxPoint px = e.GetPosition();
+    wxPoint target = ToGrid(px);
+
+    // The end snaps to a port, then to an existing wire, then to the grid --
+    // the same priority a brand new run uses.
+    int compId = -1, portIdx = -1;
+    if (FindPortAt(px, compId, portIdx))
+    {
+        const Port* p = m_circuit->FindPort(compId, portIdx);
+        if (p) target = p->grid;
+    }
+    else
+    {
+        int seg = -1;
+        wxPoint snap;
+        if (HitWire(px, seg, snap) >= 0) target = snap;
+    }
+
+    // Rebuild from the snapshot so the drag is idempotent.
+    m_circuit->wires = m_wireSnapshot;
+
+    Wire& w = m_circuit->wires[m_endWireIndex];
+    if (w.points.size() != 2) return;
+
+    const wxPoint oldA = w.points[0];
+    const wxPoint oldB = w.points[1];
+    wxPoint newA = oldA, newB = oldB;
+    (m_endAtStart ? newA : newB) = target;
+    if (newA == newB) return;                  // collapsed: keep the last shape
+
+    if (!m_endMoveSnapshotted)
+    {
+        SnapshotForUndo();
+        m_endMoveSnapshotted = true;
+    }
+
+    const int aComp = w.srcComp, aPort = w.srcPort;
+    const int bComp = w.dstComp, bPort = w.dstPort;
+
+    const std::vector<wnRelocPiece> pieces = wnRelocate(oldA, oldB, newA, newB);
+    if (pieces.empty()) return;
+
+    std::vector<Wire> out;
+    for (size_t k = 0; k < pieces.size(); ++k)
+    {
+        Wire nw;
+        nw.group    = w.group;
+        // Deliberately keep the selection state: the wire stays "not selected",
+        // so grabbing its end a second time stretches it again instead of
+        // suddenly turning into a whole-run move.
+        nw.selected = w.selected;
+        nw.points.push_back(pieces[k].a);
+        nw.points.push_back(pieces[k].b);
+
+        auto bind = [&](int src, int& comp, int& port)
+        {
+            if      (src == 0) { comp = aComp; port = aPort; }
+            else if (src == 1) { comp = bComp; port = bPort; }
+            else               { comp = -1;    port = -1;    }   // inserted jog
+        };
+        bind(pieces[k].srcA, nw.srcComp, nw.srcPort);
+        bind(pieces[k].srcB, nw.dstComp, nw.dstPort);
+        out.push_back(nw);
+    }
+
+    m_circuit->wires.erase(m_circuit->wires.begin() + m_endWireIndex);
+    for (size_t k = 0; k < out.size(); ++k) m_circuit->wires.push_back(out[k]);
+
+    // Re-glue the ends that are sitting on a port (the inserted jog has none).
+    for (Wire& q : m_circuit->wires)
+    {
+        if (q.srcComp < 0) BindEndToPort(q, true);
+        if (q.dstComp < 0) BindEndToPort(q, false);
+    }
+
+    DoEvaluate();
+    Refresh();
+}
+
 void CircuitCanvas::OnPlaceClick(const wxPoint& grid)
 {
     ComponentType t = TypeForTool(m_tool);
@@ -1318,6 +1557,15 @@ void CircuitCanvas::OnTextClick(const wxMouseEvent& e)
 // the Logisim rule that a connection needs an end point.
 void CircuitCanvas::OnLeftDClick(wxMouseEvent& e)
 {
+    // Double clicking during a click-to-place run is the "I am done" gesture.
+    if (m_drawingWire && m_wireSticky)
+    {
+        UpdateWireTarget(e.GetPosition());
+        UpdateWirePath(m_wireTarget);
+        FinishWire();
+        return;
+    }
+    if (m_drawingWire) return;
     if (m_tool != TOOL_EDIT) return;
     ToggleJunction(e.GetPosition());
 }
@@ -1872,14 +2120,15 @@ void CircuitCanvas::DrawScene(wxDC& dc)
     for (auto& t : m_circuit->texts) DrawTextLabel(dc, t);
     DrawPortDots(dc);
 
-    // Live wire preview: the path built so far.
-    if (m_drawingWire && m_path.size() >= 2)
+    // Live wire preview: exactly the geometry a release would commit.
+    if (m_drawingWire)
     {
+        const std::vector<wxPoint> preview = BuildCommitPath();
         dc.SetPen(wxPen(wxColour(0, 120, 255), 2));
-        for (size_t i = 0; i + 1 < m_path.size(); ++i)
+        for (size_t i = 0; i + 1 < preview.size(); ++i)
         {
-            wxPoint a = ToPx(m_path[i]);
-            wxPoint b = ToPx(m_path[i + 1]);
+            wxPoint a = ToPx(preview[i]);
+            wxPoint b = ToPx(preview[i + 1]);
             if (a.x == b.x || a.y == b.y)
             {
                 dc.DrawLine(a, b);
@@ -2158,9 +2407,43 @@ void CircuitCanvas::DrawPortDots(wxDC& dc)
     if (!m_circuit) return;
     int r = (int)wxRound(2.5 * m_zoom);
     if (r < 2) r = 2;
-    dc.SetPen(wxPen(wxColour(60, 60, 60), 1));
-    dc.SetBrush(wxBrush(wxColour(60, 60, 60)));
+
+    // A pin that nothing is plugged into is the number one reason a circuit
+    // silently does nothing, so the two states look clearly different:
+    // wired = filled dark dot, floating = hollow warm ring.
     for (auto& c : m_circuit->comps)
-        for (auto& p : c.ports)
-            dc.DrawCircle(ToPx(p.grid), r);
+    {
+        for (size_t k = 0; k < c.ports.size(); ++k)
+        {
+            const wxPoint pp = ToPx(c.ports[k].grid);
+            if (PortIsConnected(c.id, (int)k))
+            {
+                dc.SetPen(wxPen(wxColour(60, 60, 60), 1));
+                dc.SetBrush(wxBrush(wxColour(60, 60, 60)));
+                dc.DrawCircle(pp, r);
+            }
+            else
+            {
+                dc.SetPen(wxPen(wxColour(198, 74, 40), 2));
+                dc.SetBrush(wxBrush(*wxWHITE));
+                dc.DrawCircle(pp, r + 1);
+            }
+        }
+    }
+
+    // Hover / drag feedback: ring the connection point the mouse is on, so it
+    // is obvious where a wire would attach before the button goes down.
+    if (!m_hasMouse || m_tool != TOOL_EDIT) return;
+
+    int compId = -1, portIdx = -1;
+    if (FindPortAt(m_curPx, compId, portIdx))
+    {
+        const Port* p = m_circuit->FindPort(compId, portIdx);
+        if (p)
+        {
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.SetPen(wxPen(wxColour(0, 160, 0), 2));
+            dc.DrawCircle(ToPx(p->grid), r + 4);
+        }
+    }
 }

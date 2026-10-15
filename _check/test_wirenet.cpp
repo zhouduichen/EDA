@@ -99,6 +99,55 @@ static void TestExtendPath()
     Check(Ortho(r) && r.back() == P(9, 4), "diagonal jump stays orthogonal", Dump(r));
 }
 
+// Click-to-place wiring: the part a click already fixed must stop following the
+// mouse, while the rubber band behind it keeps growing and shrinking.
+static void TestReplayTrail()
+{
+    auto P = [](int x, int y) { return wxPoint(x, y); };
+    std::vector<wxPoint> out;
+
+    // No click yet: the whole run is live and equals the incremental path.
+    std::vector<wxPoint> live;
+    live.push_back(P(0, 0));
+    wnExtendPath(live, P(5, 0));
+    wnExtendPath(live, P(5, 3));
+    wnExtendPath(live, P(8, 3));
+
+    std::vector<wxPoint> prefix;
+    prefix.push_back(P(0, 0));
+    std::vector<wxPoint> trail;
+    trail.push_back(P(5, 0));
+    trail.push_back(P(5, 3));
+    trail.push_back(P(8, 3));
+    wnReplayTrail(prefix, trail, out);
+    Check(out == live, "trail replay matches the incremental path", Dump(out));
+
+    // One click froze the corner (5,3): the prefix may no longer move, and the
+    // rubber band goes on from there.
+    prefix.push_back(P(5, 0));
+    prefix.push_back(P(5, 3));
+    trail.clear();
+    trail.push_back(P(8, 3));
+    wnReplayTrail(prefix, trail, out);
+    Check(out.size() == 4 && out.back() == P(8, 3), "rubber band continues from the click", Dump(out));
+
+    // Pulling the pointer back retracts only the live part.
+    trail.push_back(P(5, 3));
+    wnReplayTrail(prefix, trail, out);
+    Check(out.size() == 3 && out[2] == P(5, 3), "the frozen corner stays put", Dump(out));
+
+    // Moving somewhere else keeps the frozen corner and bends the live tail.
+    trail.push_back(P(2, 3));
+    wnReplayTrail(prefix, trail, out);
+    Check(out.size() == 4 && out[2] == P(5, 3) && out.back() == P(2, 3),
+          "the live tail bends without moving the corner", Dump(out));
+
+    // An empty trail is just the frozen prefix.
+    trail.clear();
+    wnReplayTrail(prefix, trail, out);
+    Check(out == prefix, "no trail leaves the prefix untouched", Dump(out));
+}
+
 static void TestInsertJog()
 {
     std::vector<wxPoint> v;
@@ -415,6 +464,7 @@ int main()
 {
     TestNormalize();
     TestExtendPath();
+    TestReplayTrail();
     TestInsertJog();
     TestNets();
     TestCrossing();

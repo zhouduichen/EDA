@@ -219,6 +219,16 @@ void wnExtendPath(std::vector<wxPoint>& path, const wxPoint& g)
     path.push_back(g);
 }
 
+// Replay a frozen prefix plus the pointer trail into a path.
+void wnReplayTrail(const std::vector<wxPoint>& prefix,
+                   const std::vector<wxPoint>& trail,
+                   std::vector<wxPoint>& out)
+{
+    out = prefix;
+    if (out.empty()) return;
+    for (size_t i = 0; i < trail.size(); ++i) wnExtendPath(out, trail[i]);
+}
+
 bool wnInsertJog(std::vector<wxPoint>& pts, int seg)
 {
     if (seg < 0 || seg + 1 >= (int)pts.size()) return false;

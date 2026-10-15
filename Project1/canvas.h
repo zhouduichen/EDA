@@ -115,6 +115,16 @@ private:
     wxPoint m_wireDownPx;
     bool   m_wireDragged = false;
 
+    // Click-to-place ("sticky") run.  A plain click on a port does not cancel
+    // the wire: the run stays alive and follows the mouse with no button held,
+    // every further click pins one more corner, and a click on a port -- or a
+    // double click -- finishes it.  Holding the button down and dragging keeps
+    // working exactly as before; this is the alternative for long routes where
+    // holding the button the whole way is just painful.
+    bool   m_wireSticky = false;
+    std::vector<wxPoint> m_wirePrefix;   // frozen part of a sticky run
+    std::vector<wxPoint> m_pointerTrail; // grid points visited since the freeze
+
     // Where the path would land right now (refreshed on every mouse move).
     wxPoint m_wireTarget;
     bool    m_wireTargetOnPort = false;
@@ -132,6 +142,15 @@ private:
     bool m_wireMoveSnapshotted = false;
     bool m_wireBranchPending = false;
     int  m_dragWireIndex = -1;
+
+    // Dragging the loose end of an existing wire.  Pulling it out lengthens the
+    // wire, pushing it back shortens it, and moving it sideways turns it --
+    // which is what people expect to be able to do to a wire they already drew,
+    // instead of deleting it and starting over.
+    bool m_draggingEnd = false;
+    bool m_endMoveSnapshotted = false;
+    int  m_endWireIndex = -1;
+    bool m_endAtStart = false;
     wxPoint m_wireDragStartGrid;
     wxPoint m_wireBranchStartPx;
     wxPoint m_wireBranchPoint;
@@ -145,6 +164,7 @@ private:
     std::vector<wxPoint> m_moveOrigins;
 
     wxPoint m_curGrid;
+    wxPoint m_curPx;
     bool    m_hasMouse = false;
 
     // Cached junction dots; rebuilt only when the wire geometry changes.
@@ -185,6 +205,10 @@ private:
     void StartWireAtPoint(const wxPoint& grid, const wxPoint& px);
     void UpdateWireTarget(const wxPoint& px);
     void UpdateWirePath(const wxPoint& g);
+    // The exact geometry FinishWire() would commit right now.  The live preview
+    // paints this, so the rubber band never promises something else than what
+    // is actually written into the circuit on release.
+    std::vector<wxPoint> BuildCommitPath() const;
     void FinishWire();
     void CancelWire();
     int  AppendRun(const std::vector<wxPoint>& path, int group);
@@ -207,6 +231,7 @@ private:
     void OnTextClick(const wxMouseEvent& e);
     void OnMoveDrag(const wxMouseEvent& e);
     void OnWireMoveDrag(const wxMouseEvent& e);
+    void OnWireEndDrag(const wxMouseEvent& e);
 
     // Painting.
     void OnPaint(wxPaintEvent& e);
