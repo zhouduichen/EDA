@@ -11,6 +11,7 @@
 
 class wxCheckBox;
 class wxCloseEvent;
+class wxBoxSizer;
 class wxStaticText;
 
 namespace cse {
@@ -31,6 +32,9 @@ public:
                      const IComponentLibrary& library, SchematicCanvas* canvas,
                      std::function<void()> on_closed);
 
+    // 电路模型变化后重建输入/输出列表，并保留仍存在的输入状态。
+    void RefreshCircuit();
+
 private:
     void BuildContent();
     void Run();
@@ -42,6 +46,7 @@ private:
     const IComponentLibrary& library_;
     SchematicCanvas* canvas_;
     std::function<void()> on_closed_;
+    wxBoxSizer* root_sizer_{nullptr};
     std::vector<std::pair<ComponentId, wxCheckBox*>> input_checks_;
     std::vector<std::pair<ComponentId, wxStaticText*>> output_values_;
     wxStaticText* status_text_{nullptr};

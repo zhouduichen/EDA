@@ -1,5 +1,7 @@
 #include "src/ui/simulation_dialog.hpp"
 
+#include <unordered_map>
+
 #include <wx/checkbox.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
@@ -57,15 +59,15 @@ void SimulationDialog::OnClose(wxCloseEvent& event) {
 wxString SimulationDialog::ComponentLabel(const ComponentInstance& component) const {
     const auto label_iterator = component.properties.find("label");
     if (label_iterator != component.properties.end() && !label_iterator->second.empty()) {
-        return component.reference + L"（" + label_iterator->second + L"）";
+        return wxString(component.reference) + L"（" + wxString(label_iterator->second) + L"）";
     }
-    return component.reference;
+    return wxString(component.reference);
 }
 
 void SimulationDialog::BuildContent() {
-    auto* root_sizer = new wxBoxSizer(wxVERTICAL);
+    root_sizer_ = new wxBoxSizer(wxVERTICAL);
 
-    root_sizer->Add(new wxStaticText(this, wxID_ANY, L"输入（勾选 = 高电平）"), 0,
+    root_sizer_->Add(new wxStaticText(this, wxID_ANY, L"输入（勾选 = 高电平）"), 0,
                     wxALL, 8);
     const SchematicSnapshot snapshot = editor_.GetSnapshot();
     bool has_input = false;
@@ -75,16 +77,16 @@ void SimulationDialog::BuildContent() {
         }
         has_input = true;
         auto* check = new wxCheckBox(this, wxID_ANY, ComponentLabel(component));
-        root_sizer->Add(check, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
+        root_sizer_->Add(check, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
         check->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { Run(); });
         input_checks_.emplace_back(component.id, check);
     }
     if (!has_input) {
-        root_sizer->Add(new wxStaticText(this, wxID_ANY, L"（图中没有 io.input 元件）"), 0,
+        root_sizer_->Add(new wxStaticText(this, wxID_ANY, L"（图中没有 io.input 元件）"), 0,
                         wxLEFT | wxRIGHT | wxBOTTOM, 8);
     }
 
-    root_sizer->Add(new wxStaticText(this, wxID_ANY, L"输出"), 0, wxALL, 8);
+    root_sizer_->Add(new wxStaticText(this, wxID_ANY, L"输出"), 0, wxALL, 8);
     bool has_output = false;
     for (const ComponentInstance& component : snapshot.components) {
         if (component.type_id != "io.output") {
@@ -92,22 +94,49 @@ void SimulationDialog::BuildContent() {
         }
         has_output = true;
         auto* value_text = new wxStaticText(this, wxID_ANY, ComponentLabel(component) + L" = ?");
-        root_sizer->Add(value_text, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
+        root_sizer_->Add(value_text, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
         output_values_.emplace_back(component.id, value_text);
     }
     if (!has_output) {
-        root_sizer->Add(new wxStaticText(this, wxID_ANY, L"（图中没有 io.output 元件）"), 0,
+        root_sizer_->Add(new wxStaticText(this, wxID_ANY, L"（图中没有 io.output 元件）"), 0,
                         wxLEFT | wxRIGHT | wxBOTTOM, 8);
     }
 
     status_text_ = new wxStaticText(this, wxID_ANY, wxEmptyString);
-    root_sizer->Add(status_text_, 0, wxALL, 8);
+    root_sizer_->Add(status_text_, 0, wxALL, 8);
 
-    root_sizer->Add(new wxStaticText(this, wxID_ANY,
-                                     L"画布可视化：导线颜色 红=1 绿=0 橙=X（未知）"),
+    root_sizer_->Add(new wxStaticText(this, wxID_ANY,
+                                      L"画布可视化：导线颜色 红=1 绿=0 橙=X（未知）"),
                     0, wxALL, 8);
 
-    SetSizerAndFit(root_sizer);
+    SetSizerAndFit(root_sizer_);
+}
+
+void SimulationDialog::RefreshCircuit() {
+    std::unordered_map<ComponentId, bool> input_states;
+    for (const auto& [component_id, check] : input_checks_) {
+        input_states[component_id] = check->GetValue();
+    }
+
+    input_checks_.clear();
+    output_values_.clear();
+    status_text_ = nullptr;
+    wxSizer* old_sizer = GetSizer();
+    if (old_sizer != nullptr) {
+        old_sizer->Clear(true);
+        SetSizer(nullptr, false);
+        delete old_sizer;
+    }
+    root_sizer_ = nullptr;
+
+    BuildContent();
+    for (const auto& [component_id, check] : input_checks_) {
+        const auto state_iterator = input_states.find(component_id);
+        if (state_iterator != input_states.end()) {
+            check->SetValue(state_iterator->second);
+        }
+    }
+    Run();
 }
 
 void SimulationDialog::Run() {

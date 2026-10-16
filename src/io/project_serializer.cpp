@@ -1,9 +1,12 @@
 #include "src/io/project_serializer.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -59,6 +62,152 @@ namespace cse::io {
             return entries;
         }
 
+        bool NeedsQuotedValue(const std::string& value) {
+            if (value.empty()) {
+                return true;
+            }
+            return std::any_of(value.begin(), value.end(), [](char character) {
+                return std::isspace(static_cast<unsigned char>(character)) != 0 ||
+                       character == '"' || character == '\\';
+            });
+        }
+
+        std::string FormatPropertyValue(const std::string& value) {
+            if (!NeedsQuotedValue(value)) {
+                return value;
+            }
+
+            std::string escaped = "\"";
+            for (char character : value) {
+                switch (character) {
+                    case '\\':
+                        escaped += "\\\\";
+                        break;
+                    case '"':
+                        escaped += "\\\"";
+                        break;
+                    case '\n':
+                        escaped += "\\n";
+                        break;
+                    case '\r':
+                        escaped += "\\r";
+                        break;
+                    case '\t':
+                        escaped += "\\t";
+                        break;
+                    default:
+                        escaped.push_back(character);
+                        break;
+                }
+            }
+            escaped.push_back('"');
+            return escaped;
+        }
+
+        std::vector<std::string> TokenizeFields(const std::string& text, bool* valid) {
+            std::vector<std::string> fields;
+            *valid = true;
+            std::size_t index = 0;
+            while (index < text.size()) {
+                while (index < text.size() &&
+                       std::isspace(static_cast<unsigned char>(text[index])) != 0) {
+                    ++index;
+                }
+                if (index == text.size()) {
+                    break;
+                }
+
+                std::string field;
+                while (index < text.size() &&
+                       std::isspace(static_cast<unsigned char>(text[index])) == 0) {
+                    if (text[index] != '"') {
+                        field.push_back(text[index++]);
+                        continue;
+                    }
+
+                    ++index;
+                    bool closed = false;
+                    while (index < text.size()) {
+                        const char character = text[index++];
+                        if (character == '"') {
+                            closed = true;
+                            break;
+                        }
+                        if (character != '\\') {
+                            field.push_back(character);
+                            continue;
+                        }
+                        if (index == text.size()) {
+                            *valid = false;
+                            return {};
+                        }
+                        const char escaped = text[index++];
+                        switch (escaped) {
+                            case 'n':
+                                field.push_back('\n');
+                                break;
+                            case 'r':
+                                field.push_back('\r');
+                                break;
+                            case 't':
+                                field.push_back('\t');
+                                break;
+                            case '\\':
+                                field.push_back('\\');
+                                break;
+                            case '"':
+                                field.push_back('"');
+                                break;
+                            default:
+                                field.push_back(escaped);
+                                break;
+                        }
+                    }
+                    if (!closed) {
+                        *valid = false;
+                        return {};
+                    }
+                }
+                fields.push_back(std::move(field));
+            }
+            return fields;
+        }
+
+        Result<void> ValidateSnapshot(const SchematicSnapshot& snapshot) {
+            std::unordered_set<ComponentId> component_ids;
+            for (const ComponentInstance& component : snapshot.components) {
+                if (component.id == kInvalidComponentId || component.type_id.empty() ||
+                    component.reference.empty() || !std::isfinite(component.position.x) ||
+                    !std::isfinite(component.position.y) ||
+                    !std::isfinite(component.rotation_deg) ||
+                    !component_ids.insert(component.id).second) {
+                    return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                 "invalid or duplicate component");
+                }
+            }
+
+            std::unordered_set<WireId> wire_ids;
+            for (const WireModel& wire : snapshot.wires) {
+                if (wire.id == kInvalidWireId || !wire_ids.insert(wire.id).second ||
+                    !std::isfinite(wire.from.position.x) ||
+                    !std::isfinite(wire.from.position.y) ||
+                    !std::isfinite(wire.to.position.x) ||
+                    !std::isfinite(wire.to.position.y) ||
+                    (wire.from.position.x == wire.to.position.x &&
+                     wire.from.position.y == wire.to.position.y)) {
+                    return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                 "invalid or duplicate wire");
+                }
+                for (const Point2D& point : wire.route_points) {
+                    if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+                        return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                     "invalid wire route point");
+                    }
+                }
+            }
+            return Result<void>::Success();
+        }
+
     }  // namespace
 
     Result<void> SaveProject(const SchematicSnapshot& snapshot, const std::string& path) {
@@ -76,7 +225,7 @@ namespace cse::io {
                 << FormatDouble(component.position.y) << ' '
                 << FormatDouble(component.rotation_deg);
             for (const auto& [key, value] : SortedProperties(component.properties)) {
-                stream << ' ' << key << '=' << value;
+                stream << ' ' << key << '=' << FormatPropertyValue(value);
             }
             stream << '\n';
         }
@@ -128,6 +277,7 @@ namespace cse::io {
         }
 
         SchematicSnapshot snapshot;
+        bool found_end = false;
         int line_number = 1;
         while (std::getline(stream, line)) {
             ++line_number;
@@ -140,6 +290,7 @@ namespace cse::io {
                 continue;
             }
             if (tag == "END") {
+                found_end = true;
                 break;
             }
             if (tag == "COMP") {
@@ -150,8 +301,16 @@ namespace cse::io {
                     return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
                         "bad COMP record at line " + std::to_string(line_number));
                 }
-                std::string token;
-                while (row >> token) {
+                std::string property_text;
+                std::getline(row, property_text);
+                bool fields_valid = true;
+                const std::vector<std::string> fields =
+                    TokenizeFields(property_text, &fields_valid);
+                if (!fields_valid) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "bad quoted property at line " + std::to_string(line_number));
+                }
+                for (const std::string& token : fields) {
                     const std::size_t equals = token.find('=');
                     if (equals == std::string::npos || equals == 0) {
                         return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
@@ -202,6 +361,12 @@ namespace cse::io {
                         }
                         wire.route_points.push_back(point);
                     }
+                    std::string extra;
+                    if (row >> extra) {
+                        return Result<SchematicSnapshot>::Failure(
+                            ErrorCode::kInvalidFileFormat,
+                            "extra WIRE field at line " + std::to_string(line_number));
+                    }
                 }
                 snapshot.wires.push_back(std::move(wire));
             }
@@ -209,6 +374,14 @@ namespace cse::io {
                 return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
                     "unknown record at line " + std::to_string(line_number));
             }
+        }
+        if (!found_end) {
+            return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                "missing END record: " + path);
+        }
+        const Result<void> validation = ValidateSnapshot(snapshot);
+        if (!validation.ok) {
+            return Result<SchematicSnapshot>::Failure(validation.code, validation.message);
         }
         return Result<SchematicSnapshot>::Success(std::move(snapshot));
     }

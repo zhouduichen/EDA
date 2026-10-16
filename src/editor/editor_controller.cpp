@@ -337,6 +337,7 @@ void EditorController::LoadSnapshot(const SchematicSnapshot& snapshot) {
         WireModel copy = wire;
         static_cast<void>(model_.AddWire(copy));
     }
+    factory_.SyncWithSnapshot(model_.GetSnapshot());
     NotifyModelChanged();
 }
 

@@ -7,7 +7,7 @@
 
 namespace cse::io {
 
-	// 工程文件格式（纯文本，每行一条记录，字段用空格分隔）：
+	// 工程文件格式（纯文本，每行一条记录，字段用空格分隔；属性值必要时使用引号）：
 	//
 	//   CSEPROJ 1
 	//   COMP <id> <type_id> <reference> <x> <y> <rotation> [<key>=<value> ...]

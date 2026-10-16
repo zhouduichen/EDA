@@ -52,6 +52,55 @@ namespace {
         std::filesystem::remove(path);
     }
 
+    void TestProjectPropertyEscapingAndValidation() {
+        cse::SchematicSnapshot snapshot;
+        cse::ComponentInstance input;
+        input.id = 1;
+        input.type_id = "io.input";
+        input.reference = "IN1";
+        input.position = {10.0, 20.0};
+        input.properties["label"] = "Clock Input \"A\"\\main";
+        input.properties["empty"] = "";
+        snapshot.components.push_back(input);
+
+        const std::string path = "cse_test_property_escape.cseproj";
+        assert(cse::io::SaveProject(snapshot, path).ok);
+        const cse::Result<cse::SchematicSnapshot> loaded = cse::io::LoadProject(path);
+        assert(loaded.ok);
+        assert(loaded.value.components.size() == 1);
+        assert(loaded.value.components[0].properties.at("label") ==
+               "Clock Input \"A\"\\main");
+        assert(loaded.value.components[0].properties.at("empty").empty());
+        std::filesystem::remove(path);
+
+        const std::string missing_end_path = "cse_test_missing_end.cseproj";
+        {
+            std::ofstream stream(missing_end_path, std::ios::binary);
+            assert(stream.is_open());
+            stream << "CSEPROJ 1\nCOMP 1 io.input IN1 10.000000 20.000000 0.000000\n";
+        }
+        const cse::Result<cse::SchematicSnapshot> missing_end =
+            cse::io::LoadProject(missing_end_path);
+        assert(!missing_end.ok);
+        assert(missing_end.code == cse::ErrorCode::kInvalidFileFormat);
+        std::filesystem::remove(missing_end_path);
+
+        const std::string duplicate_id_path = "cse_test_duplicate_id.cseproj";
+        {
+            std::ofstream stream(duplicate_id_path, std::ios::binary);
+            assert(stream.is_open());
+            stream << "CSEPROJ 1\n"
+                   << "COMP 1 io.input IN1 10.000000 20.000000 0.000000\n"
+                   << "COMP 1 io.output OUT1 100.000000 20.000000 0.000000\n"
+                   << "END\n";
+        }
+        const cse::Result<cse::SchematicSnapshot> duplicate_id =
+            cse::io::LoadProject(duplicate_id_path);
+        assert(!duplicate_id.ok);
+        assert(duplicate_id.code == cse::ErrorCode::kInvalidFileFormat);
+        std::filesystem::remove(duplicate_id_path);
+    }
+
     // ---- 测试用小工具：按 id/类型/位号/坐标造元件和导线 ----
 
     cse::ComponentInstance MakeComponent(cse::ComponentId id, const std::string& type_id,
@@ -530,6 +579,14 @@ namespace {
         assert(editor.GetSnapshot().components.size() == 1);
         assert(editor.GetSnapshot().components.front().reference == "IN1");
         assert(!editor.CanUndo() && !editor.CanRedo());  // 加载后历史作废
+
+        // 加载后继续放置，ID 和位号必须从当前工程接着分配，而不是回到 1。
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({200.0, 20.0}));
+        const cse::ComponentInstance placed =
+            editor.GetComponent(editor.GetSelection().component_ids.front()).value();
+        assert(placed.id == 2);
+        assert(placed.reference == "IN2");
         std::filesystem::remove(path);
     }
 
@@ -718,6 +775,7 @@ int main() {
     TestModelCrudAndRevision();
     TestEditorCommandsAndWireWorkflow();
     TestProjectSaveFormat();          // ← 加这一行
+    TestProjectPropertyEscapingAndValidation();
     TestProjectSaveLoadRoundtrip();
     TestBuildNetsPinsAndTJunction();
     TestBuildNetsSharedPin();

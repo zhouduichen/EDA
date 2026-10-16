@@ -32,7 +32,12 @@ MainFrame::MainFrame(editor::EditorController& editor, const IComponentLibrary& 
     const int status_widths[2] = {-1, 190};
     GetStatusBar()->SetStatusWidths(2, status_widths);
 
-    editor_.SetModelChangedHandler([this](const ModelChangedEvent&) { RefreshViews(); });
+    editor_.SetModelChangedHandler([this](const ModelChangedEvent&) {
+        RefreshViews();
+        if (simulation_dialog_ != nullptr) {
+            simulation_dialog_->RefreshCircuit();
+        }
+    });
     editor_.SetSelectionChangedHandler([this](const SelectionChangedEvent&) { RefreshViews(); });
     RefreshViews();
     Centre();
@@ -149,7 +154,10 @@ void MainFrame::BuildContent() {
 
 void MainFrame::OnNew(wxCommandEvent& event) {
     static_cast<void>(event);
-    GetStatusBar()->SetStatusText(L"当前版本暂未接入工程文件的新建", 0);
+    editor_.LoadSnapshot(SchematicSnapshot{});
+    editor_.SetToolMode(ToolMode::kSelect);
+    panel_canvas_->SetFocus();
+    GetStatusBar()->SetStatusText(L"已新建空白工程", 0);
 }
 
 void MainFrame::OnOpen(wxCommandEvent& event) {
