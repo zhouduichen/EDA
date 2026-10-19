@@ -142,6 +142,11 @@ void CircuitCanvas::SetCircuit(Circuit* c)
     m_dragWireIndex = -1;
     m_undo.clear();
     m_redo.clear();
+
+    // Switching tabs while the simulator is on must show the new circuit's own
+    // values, not whatever was left over from the previous tab.
+    if (m_sim && m_circuit) EvaluateCircuit(*m_circuit, m_project);
+
     Refresh();
 }
 
@@ -158,7 +163,10 @@ void CircuitCanvas::SetSimulationEnabled(bool on)
 {
     bool changed = (m_sim != on);
     m_sim = on;
-    if (on && m_circuit) EvaluateCircuit(*m_circuit);
+    // Pass the project: without it a sub-circuit instance cannot be expanded,
+    // so custom parts would come up dead until the next edit happened to
+    // trigger DoEvaluate().
+    if (on && m_circuit) EvaluateCircuit(*m_circuit, m_project);
     Refresh();
     if (changed && m_onSimulation) m_onSimulation(m_sim);
 }

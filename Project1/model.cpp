@@ -181,6 +181,19 @@ namespace
         {
             if (sc.type == CT_SubCircuit)
             {
+                // The instance inside a definition still has to show up in the
+                // port table, even though it computes nothing itself: its edge
+                // ports are the points the definition's own wiring plugs into,
+                // and they are one end of the alias that binds them to the pins
+                // of the expanded copy.  Without this node that alias has only
+                // one real end and is thrown away -- which is precisely why a
+                // part inside a part used to come out dead.
+                EvalNode anchor;
+                anchor.comp         = sc;
+                anchor.comp.gridPos = sc.gridPos + delta;
+                for (auto& p : anchor.comp.ports) p.grid = p.grid + delta;
+                nodes.push_back(anchor);
+
                 if (depth >= kMaxSubDepth || !project) continue;
                 const Circuit* sub = FindCircuitIn(*project, sc.subName);
                 if (!sub || sub == &def) continue;

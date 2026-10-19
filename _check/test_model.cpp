@@ -4,6 +4,7 @@
 #include "wirenet.h"
 
 #include <cstdio>
+#include <crtdbg.h>
 
 static int g_fail = 0;
 
@@ -312,8 +313,665 @@ static void TestSubCircuitPinLayout()
     Check(true, "layout: a pinless instance does not crash");
 }
 
+// ---------------------------------------------------------------------------
+// Custom parts UNDER SIMULATION.
+//
+// The layout tests above only look at coordinates.  These put the box to work:
+// every input combination, several instances at once, a part inside a part,
+// a part with two outputs, a part with a dead pin, and the pathological case
+// of a circuit that (indirectly) instantiates itself.
+// ---------------------------------------------------------------------------
+
+static LogicValue Read(Circuit& c, int compId)
+{
+    Component* p = c.FindComponent(compId);
+    if (!p || p->ports.empty()) return LV_Unknown;
+    return p->ports[0].value;
+}
+
+// AND2: two inputs on the left, one output on the right, pins deliberately
+// drawn nowhere near the gate -- the whole point of the edge layout.
+static void MakeAnd2(Circuit& def)
+{
+    def.name = wxT("AND2");
+    const int a = AddComp(def, CT_PinIn,  0, 0);     // port (2,1)
+    const int b = AddComp(def, CT_PinIn,  0, 8);     // port (2,9)
+    const int g = AddComp(def, CT_And,   20, 4);     // in (20,5)(20,7), out (22,6)
+    const int z = AddComp(def, CT_PinOut,30, 6);     // port (30,7)
+    AddSeg(def, wxPoint(2, 1),  wxPoint(20, 1), a, 0);
+    AddSeg(def, wxPoint(20, 1), wxPoint(20, 5), -1, -1, g, 0);
+    AddSeg(def, wxPoint(2, 9),  wxPoint(18, 9), b, 0);
+    AddSeg(def, wxPoint(18, 9), wxPoint(18, 7));
+    AddSeg(def, wxPoint(18, 7), wxPoint(20, 7), -1, -1, g, 1);
+    AddSeg(def, wxPoint(22, 6), wxPoint(28, 6), g, 2);
+    AddSeg(def, wxPoint(28, 6), wxPoint(28, 7));
+    AddSeg(def, wxPoint(28, 7), wxPoint(30, 7), -1, -1, z, 0);
+}
+
+// Wire a top circuit up to one instance of a 3-port part (2 in, 1 out).
+// Returns false when the instance did not expose three ports.
+static bool WireUpAnd2(Circuit& top, int subId, int& p0, int& p1, int& po)
+{
+    Component* inst = top.FindComponent(subId);
+    if (!inst || inst->ports.size() != 3) return false;
+
+    const wxPoint i0 = inst->ports[0].grid;
+    const wxPoint i1 = inst->ports[1].grid;
+    const wxPoint o0 = inst->ports[2].grid;
+
+    p0 = AddComp(top, CT_PinIn,  0, i0.y - 1);            // port (2, i0.y)
+    p1 = AddComp(top, CT_PinIn,  0, i1.y - 1);            // port (2, i1.y)
+    po = AddComp(top, CT_PinOut, o0.x + 4, o0.y - 1);     // port (o0.x+4, o0.y)
+
+    AddSeg(top, wxPoint(2, i0.y), i0, p0, 0, subId, 0);
+    AddSeg(top, wxPoint(2, i1.y), i1, p1, 0, subId, 1);
+    AddSeg(top, o0, wxPoint(o0.x + 4, o0.y), subId, 2, po, 0);
+    top.RefreshWireEndpoints();
+    return true;
+}
+
+// NAND2 = an AND2 instance followed by a NOT.  Split in two on purpose: the
+// components are created before the project pointer exists, so the wiring can
+// only happen after LinkProject has resolved the nested instance's ports.
+static void MakeNand2Comps(Circuit& n, int& a, int& b, int& z, int& s, int& nt)
+{
+    n.name = wxT("NAND2");
+    a  = AddComp(n, CT_PinIn,   0, 0);     // port (2,1)
+    b  = AddComp(n, CT_PinIn,   0, 20);    // port (2,21)
+    z  = AddComp(n, CT_PinOut, 60, 24);    // port (60,25)
+    s  = AddSub  (n, wxT("AND2"), 10, 20);
+    nt = AddComp(n, CT_Not,    46, 24);    // in (46,25), out (49,25)
+}
+
+static bool WireNand2(Circuit& n, int a, int b, int z, int s, int nt)
+{
+    Component* inner = n.FindComponent(s);
+    if (!inner || inner->ports.size() != 3) return false;
+    AddSeg(n, wxPoint(2, 1),  wxPoint(10, 1), a, 0);
+    AddSeg(n, wxPoint(10, 1), inner->ports[0].grid, -1, -1, s, 0);
+    AddSeg(n, wxPoint(2, 21), wxPoint(8, 21), b, 0);
+    AddSeg(n, wxPoint(8, 21), wxPoint(8, 26));
+    AddSeg(n, wxPoint(8, 26), inner->ports[1].grid, -1, -1, s, 1);
+    AddSeg(n, inner->ports[2].grid, wxPoint(46, 25), s, 2, nt, 0);
+    AddSeg(n, wxPoint(49, 25), wxPoint(60, 25), nt, 1, z, 0);
+    n.RefreshWireEndpoints();
+    return true;
+}
+
+static void TestSubCircuitEval()
+{
+    // ---- 1. one instance: every input combination --------------------------
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("AND2"), 10, 20);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        int p0 = -1, p1 = -1, po = -1;
+        if (!WireUpAnd2(T, s, p0, p1, po))
+        {
+            Check(false, "sub eval: the instance exposes three ports");
+            return;
+        }
+
+        const int cases[4][2] = { {1,1}, {1,0}, {0,1}, {0,0} };
+        const LogicValue want[4] = { LV_One, LV_Zero, LV_Zero, LV_Zero };
+        bool all = true;
+        for (int k = 0; k < 4; ++k)
+        {
+            T.FindComponent(p0)->value = cases[k][0];
+            T.FindComponent(p1)->value = cases[k][1];
+            EvaluateCircuit(T, &proj);
+            if (Read(T, po) != want[k]) all = false;
+        }
+        Check(all, "sub eval: AND2 part computes all four input combinations");
+
+        // The instance's own port is written back, so the box can be probed
+        // and the value is what the user sees on the wire.
+        Check(T.FindComponent(s)->ports[2].value != LV_Unknown,
+              "sub eval: the instance output port carries a value");
+    }
+
+    // ---- 2. two instances of the same part stay independent ----------------
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s1 = AddSub(top, wxT("AND2"), 10, 20);
+        const int s2 = AddSub(top, wxT("AND2"), 10, 60);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        int a[2], b[2], o[2];
+        if (!WireUpAnd2(T, s1, a[0], b[0], o[0]) ||
+            !WireUpAnd2(T, s2, a[1], b[1], o[1]))
+        {
+            Check(false, "sub eval: two instances both expose three ports");
+            return;
+        }
+
+        T.FindComponent(a[0])->value = 1;
+        T.FindComponent(b[0])->value = 1;
+        T.FindComponent(a[1])->value = 1;
+        T.FindComponent(b[1])->value = 0;
+        EvaluateCircuit(T, &proj);
+
+        Check(Read(T, o[0]) == LV_One,  "sub eval: instance 1 (1 AND 1) = 1");
+        Check(Read(T, o[1]) == LV_Zero, "sub eval: instance 2 (1 AND 0) = 0, not shorted to 1");
+    }
+
+    // ---- 3. a part inside a part -------------------------------------------
+    {
+        Circuit and2; MakeAnd2(and2);
+
+        Circuit nand;
+        int na, nb, nz, ns, nn;
+        MakeNand2Comps(nand, na, nb, nz, ns, nn);
+
+        Circuit top; top.name = wxT("main");
+        const int ts = AddSub(top, wxT("NAND2"), 10, 60);
+
+        std::vector<Circuit> proj;
+        proj.push_back(and2);
+        proj.push_back(nand);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& N = proj[1];
+        if (!WireNand2(N, na, nb, nz, ns, nn))
+        {
+            Check(false, "sub eval: the nested instance resolves three ports");
+            return;
+        }
+
+        Circuit& T = proj[2];
+        int p0 = -1, p1 = -1, po = -1;
+        if (!WireUpAnd2(T, ts, p0, p1, po))
+        {
+            Check(false, "sub eval: the outer instance exposes three ports");
+            return;
+        }
+        T.FindComponent(p0)->value = 1;
+        T.FindComponent(p1)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_Zero, "sub eval: nested part NOT(AND(1,1)) = 0");
+
+        T.FindComponent(p1)->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_One,  "sub eval: nested part NOT(AND(1,0)) = 1");
+    }
+
+    // ---- 4. a part with two outputs ----------------------------------------
+    {
+        Circuit def; def.name = wxT("SPLIT");
+        const int a  = AddComp(def, CT_PinIn,   0, 0);     // port (2,1)
+        const int bf = AddComp(def, CT_Buffer, 10, 0);     // in (10,1), out (13,1)
+        const int nt = AddComp(def, CT_Not,    10, 8);     // in (10,9), out (13,9)
+        const int z1 = AddComp(def, CT_PinOut, 20, 0);     // port (20,1)
+        const int z2 = AddComp(def, CT_PinOut, 20, 8);     // port (20,9)
+        AddSeg(def, wxPoint(2, 1),  wxPoint(6, 1),  a, 0);
+        AddSeg(def, wxPoint(6, 1),  wxPoint(10, 1), -1, -1, bf, 0);
+        AddSeg(def, wxPoint(6, 1),  wxPoint(6, 9));
+        AddSeg(def, wxPoint(6, 9),  wxPoint(10, 9), -1, -1, nt, 0);
+        AddSeg(def, wxPoint(13, 1), wxPoint(20, 1), bf, 1, z1, 0);
+        AddSeg(def, wxPoint(13, 9), wxPoint(20, 9), nt, 1, z2, 0);
+
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("SPLIT"), 10, 20);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        Component* inst = T.FindComponent(s);
+        if (!inst || inst->ports.size() != 3)
+        {
+            Check(false, "sub eval: a two-output part exposes three ports");
+            return;
+        }
+        const wxPoint i0  = inst->ports[0].grid;
+        const wxPoint oA  = inst->ports[1].grid;
+        const wxPoint oB  = inst->ports[2].grid;
+        const int pi  = AddComp(T, CT_PinIn,  0, i0.y - 1);
+        const int pa  = AddComp(T, CT_PinOut, oA.x + 4, oA.y - 1);
+        const int pb  = AddComp(T, CT_PinOut, oB.x + 4, oB.y - 1);
+        AddSeg(T, wxPoint(2, i0.y), i0, pi, 0, s, 0);
+        AddSeg(T, oA, wxPoint(oA.x + 4, oA.y), s, 1, pa, 0);
+        AddSeg(T, oB, wxPoint(oB.x + 4, oB.y), s, 2, pb, 0);
+        T.RefreshWireEndpoints();
+
+        T.FindComponent(pi)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, pa) == LV_One,  "sub eval: two outputs, straight = 1");
+        Check(Read(T, pb) == LV_Zero, "sub eval: two outputs, inverted = 0");
+
+        T.FindComponent(pi)->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, pa) == LV_Zero, "sub eval: two outputs follow the input (straight)");
+        Check(Read(T, pb) == LV_One,  "sub eval: two outputs follow the input (inverted)");
+    }
+
+    // ---- 5. a pin of the definition that is not wired up -------------------
+    // The port still exists on the box and the user can still plug a wire into
+    // it; it simply leads nowhere.  The ports that ARE wired must keep working.
+    {
+        Circuit def; def.name = wxT("HALF");
+        const int a  = AddComp(def, CT_PinIn,   0, 0);     // port (2,1)
+        AddComp(def, CT_PinIn, 0, 8);                      // port (2,9): never wired
+        const int bf = AddComp(def, CT_Buffer, 10, 0);     // in (10,1), out (13,1)
+        const int z  = AddComp(def, CT_PinOut, 20, 0);     // port (20,1)
+        AddSeg(def, wxPoint(2, 1),  wxPoint(10, 1),  a, 0, bf, 0);
+        AddSeg(def, wxPoint(13, 1), wxPoint(20, 1), bf, 1, z, 0);
+
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("HALF"), 10, 20);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        Component* inst = T.FindComponent(s);
+        if (!inst || inst->ports.size() != 3)
+        {
+            Check(false, "sub eval: the dead-pin part still exposes three ports");
+            return;
+        }
+        const wxPoint i0 = inst->ports[0].grid;
+        const wxPoint i1 = inst->ports[1].grid;
+        const wxPoint o0 = inst->ports[2].grid;
+        const int pi = AddComp(T, CT_PinIn,  0, i0.y - 1);
+        const int pd = AddComp(T, CT_PinIn,  0, i1.y - 1);
+        const int po = AddComp(T, CT_PinOut, o0.x + 4, o0.y - 1);
+        AddSeg(T, wxPoint(2, i0.y), i0, pi, 0, s, 0);
+        AddSeg(T, wxPoint(2, i1.y), i1, pd, 0, s, 1);
+        AddSeg(T, o0, wxPoint(o0.x + 4, o0.y), s, 2, po, 0);
+        T.RefreshWireEndpoints();
+
+        T.FindComponent(pi)->value = 1;
+        T.FindComponent(pd)->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_One, "sub eval: an unwired definition pin does not break the rest");
+
+        T.FindComponent(pi)->value = 0;
+        T.FindComponent(pd)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_Zero, "sub eval: the dead pin really is dead");
+    }
+
+    // ---- 6. a part placed at the origin (the expansion shift can go negative)
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("AND2"), 0, 0);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        int p0 = -1, p1 = -1, po = -1;
+        if (!WireUpAnd2(T, s, p0, p1, po))
+        {
+            Check(false, "sub eval: an instance at the origin exposes three ports");
+            return;
+        }
+        T.FindComponent(p0)->value = 1;
+        T.FindComponent(p1)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_One, "sub eval: an instance at the origin still computes");
+    }
+
+    // ---- 7. a circuit that (indirectly) instantiates itself ----------------
+    // It must not hang, must not blow the stack, and must simply not answer.
+    {
+        Circuit a; a.name = wxT("A");
+        AddSub(a, wxT("B"), 0, 0);
+        Circuit b; b.name = wxT("B");
+        AddSub(b, wxT("A"), 0, 0);
+
+        std::vector<Circuit> proj;
+        proj.push_back(a);
+        proj.push_back(b);
+        LinkProject(proj);
+        EvaluateCircuit(proj[0], &proj);
+        Check(true, "sub eval: mutual recursion terminates instead of hanging");
+    }
+
+    // ---- 8. three levels of nesting ----------------------------------------
+    {
+        Circuit and2; MakeAnd2(and2);
+
+        Circuit nand; nand.name = wxT("NAND2");
+        int na, nb, nz, ns, nn;
+        MakeNand2Comps(nand, na, nb, nz, ns, nn);
+
+        // AND3 = NOT(NAND2(a,b)) == AND(a,b), i.e. a part inside a part inside
+        // a part.  The deepest one is two expansions away from the top.
+        Circuit deep; deep.name = wxT("AND3");
+        const int da = AddComp(deep, CT_PinIn,   0, 0);    // port (2,1)
+        const int db = AddComp(deep, CT_PinIn,   0, 20);   // port (2,21)
+        const int dz = AddComp(deep, CT_PinOut, 90, 34);   // port (90,35)
+        const int ds = AddSub  (deep, wxT("NAND2"), 10, 20);
+        const int dn = AddComp(deep, CT_Not,    76, 34);   // in (76,35), out (79,35)
+
+        Circuit top; top.name = wxT("main");
+        const int ts = AddSub(top, wxT("AND3"), 10, 60);
+
+        std::vector<Circuit> proj;
+        proj.push_back(and2);
+        proj.push_back(nand);
+        proj.push_back(deep);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        WireNand2(proj[1], na, nb, nz, ns, nn);
+
+        Circuit& D = proj[2];
+        Component* inner = D.FindComponent(ds);
+        if (!inner || inner->ports.size() != 3)
+        {
+            Check(false, "sub eval: the level-2 instance resolves three ports");
+            return;
+        }
+        AddSeg(D, wxPoint(2, 1),  wxPoint(10, 1), da, 0);
+        AddSeg(D, wxPoint(10, 1), inner->ports[0].grid, -1, -1, ds, 0);
+        AddSeg(D, wxPoint(2, 21), wxPoint(8, 21),  db, 0);
+        AddSeg(D, wxPoint(8, 21), wxPoint(8, inner->ports[1].grid.y));
+        AddSeg(D, wxPoint(8, inner->ports[1].grid.y), inner->ports[1].grid, -1, -1, ds, 1);
+        AddSeg(D, inner->ports[2].grid, wxPoint(76, 35), ds, 2, dn, 0);
+        AddSeg(D, wxPoint(79, 35), wxPoint(90, 35), dn, 1, dz, 0);
+        D.RefreshWireEndpoints();
+
+        Circuit& T = proj[3];
+        int p0 = -1, p1 = -1, po = -1;
+        if (!WireUpAnd2(T, ts, p0, p1, po))
+        {
+            Check(false, "sub eval: the level-3 instance exposes three ports");
+            return;
+        }
+        T.FindComponent(p0)->value = 1;
+        T.FindComponent(p1)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_One, "sub eval: three levels deep, 1 AND 1 = 1");
+
+        T.FindComponent(p1)->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_Zero, "sub eval: three levels deep, 1 AND 0 = 0");
+    }
+
+    // ---- 9. two instances of the same part INSIDE one definition -----------
+    {
+        Circuit and2; MakeAnd2(and2);
+
+        // DUAL: out1 = AND(a,b), out2 = AND(c,d).  Four inputs, two outputs.
+        Circuit dual; dual.name = wxT("DUAL");
+        const int a = AddComp(dual, CT_PinIn,  0, 0);      // (2,1)
+        const int b = AddComp(dual, CT_PinIn,  0, 8);      // (2,9)
+        const int c = AddComp(dual, CT_PinIn,  0, 40);     // (2,41)
+        const int d = AddComp(dual, CT_PinIn,  0, 48);     // (2,49)
+        const int s1 = AddSub  (dual, wxT("AND2"), 10, 20);
+        const int s2 = AddSub  (dual, wxT("AND2"), 10, 60);
+        const int z1 = AddComp(dual, CT_PinOut, 50, 24);   // (50,25)
+        const int z2 = AddComp(dual, CT_PinOut, 50, 64);   // (50,65)
+
+        Circuit top; top.name = wxT("main");
+        const int ts = AddSub(top, wxT("DUAL"), 10, 100);
+
+        std::vector<Circuit> proj;
+        proj.push_back(and2);
+        proj.push_back(dual);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& D = proj[1];
+        Component* in1 = D.FindComponent(s1);
+        Component* in2 = D.FindComponent(s2);
+        if (!in1 || !in2 || in1->ports.size() != 3 || in2->ports.size() != 3)
+        {
+            Check(false, "sub eval: both nested instances resolve three ports");
+            return;
+        }
+        AddSeg(D, wxPoint(2, 1),  wxPoint(10, 1), a, 0);
+        AddSeg(D, wxPoint(10, 1), in1->ports[0].grid, -1, -1, s1, 0);
+        AddSeg(D, wxPoint(2, 9),  wxPoint(8, 9), b, 0);
+        AddSeg(D, wxPoint(8, 9),  wxPoint(8, in1->ports[1].grid.y));
+        AddSeg(D, wxPoint(8, in1->ports[1].grid.y), in1->ports[1].grid, -1, -1, s1, 1);
+        AddSeg(D, wxPoint(2, 41), wxPoint(10, 41), c, 0);
+        AddSeg(D, wxPoint(10, 41), in2->ports[0].grid, -1, -1, s2, 0);
+        AddSeg(D, wxPoint(2, 49), wxPoint(8, 49), d, 0);
+        AddSeg(D, wxPoint(8, 49), wxPoint(8, in2->ports[1].grid.y));
+        AddSeg(D, wxPoint(8, in2->ports[1].grid.y), in2->ports[1].grid, -1, -1, s2, 1);
+        AddSeg(D, in1->ports[2].grid, wxPoint(50, 25), s1, 2, z1, 0);
+        AddSeg(D, in2->ports[2].grid, wxPoint(50, 65), s2, 2, z2, 0);
+        D.RefreshWireEndpoints();
+
+        Circuit& T = proj[2];
+        Component* inst = T.FindComponent(ts);
+        if (!inst || inst->ports.size() != 6)
+        {
+            Check(false, "sub eval: the DUAL instance exposes six ports");
+            return;
+        }
+        // Snapshot the pin positions first: AddComp() pushes into T.comps and
+        // may reallocate it, which would dangle `inst` (and any Port inside it).
+        wxPoint inPorts[4], outPorts[2];
+        for (int k = 0; k < 4; ++k) inPorts[k]  = inst->ports[k].grid;
+        for (int k = 0; k < 2; ++k) outPorts[k] = inst->ports[4 + k].grid;
+
+        int pi[4], po[2];
+        for (int k = 0; k < 4; ++k)
+        {
+            pi[k] = AddComp(T, CT_PinIn, 0, inPorts[k].y - 1);
+            AddSeg(T, wxPoint(2, inPorts[k].y), inPorts[k], pi[k], 0, ts, k);
+        }
+        for (int k = 0; k < 2; ++k)
+        {
+            po[k] = AddComp(T, CT_PinOut, outPorts[k].x + 4, outPorts[k].y - 1);
+            AddSeg(T, outPorts[k], wxPoint(outPorts[k].x + 4, outPorts[k].y),
+                   ts, 4 + k, po[k], 0);
+        }
+        T.RefreshWireEndpoints();
+
+        T.FindComponent(pi[0])->value = 1;
+        T.FindComponent(pi[1])->value = 1;
+        T.FindComponent(pi[2])->value = 1;
+        T.FindComponent(pi[3])->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po[0]) == LV_One,  "sub eval: two nested copies, first = 1");
+        Check(Read(T, po[1]) == LV_Zero, "sub eval: two nested copies stay independent");
+    }
+
+    // ---- 10. simulating the definition circuit itself ----------------------
+    // The user looks at the part's own tab and pokes its pins; the nested
+    // instance inside it has to work there too.
+    {
+        Circuit and2; MakeAnd2(and2);
+        Circuit nand; nand.name = wxT("NAND2");
+        int na, nb, nz, ns, nn;
+        MakeNand2Comps(nand, na, nb, nz, ns, nn);
+
+        std::vector<Circuit> proj;
+        proj.push_back(and2);
+        proj.push_back(nand);
+        LinkProject(proj);
+        WireNand2(proj[1], na, nb, nz, ns, nn);
+
+        Circuit& N = proj[1];
+        N.FindComponent(na)->value = 1;
+        N.FindComponent(nb)->value = 1;
+        EvaluateCircuit(N, &proj);
+        Check(Read(N, nz) == LV_Zero, "sub eval: the definition's own tab simulates, 1 NAND 1 = 0");
+
+        N.FindComponent(nb)->value = 0;
+        EvaluateCircuit(N, &proj);
+        Check(Read(N, nz) == LV_One,  "sub eval: the definition's own tab follows its pins");
+    }
+
+    // ---- 11. two drivers fighting over one port of a part ------------------
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("AND2"), 10, 20);
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        int p0 = -1, p1 = -1, po = -1;
+        if (!WireUpAnd2(T, s, p0, p1, po)) { Check(false, "sub eval: conflict setup"); return; }
+
+        // A second pin driving the very same port of the box: come in from four
+        // rows above so the run does not disturb the other input's wire.
+        const wxPoint ip = T.FindComponent(s)->ports[0].grid;
+        const int extra = AddComp(T, CT_PinIn, 0, ip.y - 5);      // port (2, ip.y-4)
+        AddSeg(T, wxPoint(2, ip.y - 4), wxPoint(ip.x, ip.y - 4), extra, 0);
+        AddSeg(T, wxPoint(ip.x, ip.y - 4), ip, -1, -1, s, 0);
+        T.RefreshWireEndpoints();
+
+        T.FindComponent(p0)->value    = 1;
+        T.FindComponent(extra)->value = 0;
+        T.FindComponent(p1)->value    = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_Unknown, "sub eval: two drivers on one port = unknown");
+    }
+
+    // ---- 12. save / load round trip of a working custom part ----------------
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("AND2"), 10, 20);
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        int p0 = -1, p1 = -1, po = -1;
+        WireUpAnd2(proj[1], s, p0, p1, po);
+        proj[1].FindComponent(p0)->value = 1;
+        proj[1].FindComponent(p1)->value = 1;
+
+        const wxString text = SerializeProject(proj);
+        std::vector<Circuit> loaded;
+        Check(DeserializeProject(text, loaded), "sub eval: project with a part saves and loads");
+        Check(loaded.size() == 2, "sub eval: both circuits survive");
+        LinkProject(loaded);
+        EvaluateCircuit(loaded[1], &loaded);
+        Check(Read(loaded[1], po) == LV_One, "sub eval: the loaded part computes the same");
+    }
+
+    // ---- 13. a part used as a building block, not just as a probe ----------
+    // The output of the box has to drive ordinary logic in the parent...
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("AND2"), 10, 20);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        Component* inst = T.FindComponent(s);
+        if (!inst || inst->ports.size() != 3)
+        {
+            Check(false, "sub eval: chained part exposes three ports");
+            return;
+        }
+        const wxPoint i0 = inst->ports[0].grid;
+        const wxPoint i1 = inst->ports[1].grid;
+        const wxPoint o0 = inst->ports[2].grid;
+
+        const int p0 = AddComp(T, CT_PinIn,  0, i0.y - 1);
+        const int p1 = AddComp(T, CT_PinIn,  0, i1.y - 1);
+        const int nt = AddComp(T, CT_Not,   o0.x + 2, o0.y - 1);  // in (o0.x+2,o0.y)
+        const int po = AddComp(T, CT_PinOut, o0.x + 7, o0.y - 1); // port (o0.x+7,o0.y)
+
+        AddSeg(T, wxPoint(2, i0.y), i0, p0, 0, s, 0);
+        AddSeg(T, wxPoint(2, i1.y), i1, p1, 0, s, 1);
+        AddSeg(T, o0, wxPoint(o0.x + 2, o0.y), s, 2, nt, 0);
+        AddSeg(T, wxPoint(o0.x + 5, o0.y), wxPoint(o0.x + 7, o0.y), nt, 1, po, 0);
+        T.RefreshWireEndpoints();
+
+        T.FindComponent(p0)->value = 1;
+        T.FindComponent(p1)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_Zero, "sub eval: part output drives parent NOT (1 AND 1)");
+
+        T.FindComponent(p1)->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_One, "sub eval: part output drives parent NOT (1 AND 0)");
+    }
+
+    // ... and ordinary logic in the parent has to drive the box's input.
+    {
+        Circuit def; MakeAnd2(def);
+        Circuit top; top.name = wxT("main");
+        const int s = AddSub(top, wxT("AND2"), 14, 20);
+
+        std::vector<Circuit> proj;
+        proj.push_back(def);
+        proj.push_back(top);
+        LinkProject(proj);
+
+        Circuit& T = proj[1];
+        Component* inst = T.FindComponent(s);
+        if (!inst || inst->ports.size() != 3)
+        {
+            Check(false, "sub eval: driven part exposes three ports");
+            return;
+        }
+        const wxPoint i0 = inst->ports[0].grid;
+        const wxPoint i1 = inst->ports[1].grid;
+        const wxPoint o0 = inst->ports[2].grid;
+
+        const int pi = AddComp(T, CT_PinIn, 0, i0.y - 1);
+        const int nt = AddComp(T, CT_Not,   4, i0.y - 1);       // in (4,i0.y), out (7,i0.y)
+        const int p1 = AddComp(T, CT_PinIn, 0, i1.y - 1);
+        const int po = AddComp(T, CT_PinOut, o0.x + 4, o0.y - 1);
+
+        AddSeg(T, wxPoint(2, i0.y), wxPoint(4, i0.y), pi, 0, nt, 0);
+        AddSeg(T, wxPoint(7, i0.y), i0, nt, 1, s, 0);
+        AddSeg(T, wxPoint(2, i1.y), i1, p1, 0, s, 1);
+        AddSeg(T, o0, wxPoint(o0.x + 4, o0.y), s, 2, po, 0);
+        T.RefreshWireEndpoints();
+
+        T.FindComponent(pi)->value = 0;      // NOT(0) = 1 -> AND input high
+        T.FindComponent(p1)->value = 1;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_One, "sub eval: parent NOT drives part input (NOT 0 AND 1)");
+
+        T.FindComponent(p1)->value = 0;
+        EvaluateCircuit(T, &proj);
+        Check(Read(T, po) == LV_Zero, "sub eval: parent NOT drives part input (NOT 0 AND 0)");
+    }
+}
+
 int main()
 {
+    // Unbuffered so a hang localizes to the last printed check.  Assertions go
+    // to stderr instead of a modal dialog, otherwise a failed check looks like
+    // a hang when the process is started from a script.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+
     Circuit c;
 
     // PinIn(0,0) -> AND(6,0) -> PinOut(12,0)
@@ -394,6 +1052,7 @@ int main()
 
     TestSubCircuit();
     TestSubCircuitPinLayout();
+    TestSubCircuitEval();
     TestCrossingEval();
 
     printf("\n%s\n", g_fail ? "SOME CHECKS FAILED" : "all checks passed");
