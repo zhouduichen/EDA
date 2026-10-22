@@ -12,7 +12,8 @@
   自动拐点会避让其它引脚，拐点随工程文件保存；
 - AND、OR、XOR、NOT 逻辑门图形和输入/输出图形；
 - 撤销/重做；
-- 工程新建、打开/保存、KiCad 网表导出；
+- 工程新建、打开/保存、KiCad 网表 (.net) 导出；
+- 导出 KiCad 原理图 (.kicad_sch)，按 KiCad 6 格式写出，面向 KiCad 6/7/8/9；
 - AND、OR、XOR、NOT 组合逻辑仿真，支持未知值和多驱动冲突显示；
 - C++ 核心单元测试。
 
@@ -42,6 +43,22 @@ macOS 如果生成了应用包，可运行 `build/cse_editor.app/Contents/MacOS/
 - 连线：`W` 后从引脚起笔，途中点击空白处打拐点，点引脚 / 既有导线中段（T 形相接）收尾；
   双击空白或 `Enter` 就地收尾，`Backspace` 退掉最后一个拐点；
   自动拐点由 `model::PlanWireRoute` 挑一条不碰到其它引脚的直角走法。
+
+## 导出到 PCB 软件
+
+现代 KiCad（6/7/8/9）已经不支持直接导入独立 `.net` 网表，PCB 侧改为从原理图同步。
+因此菜单里的两个导出项用途不同：
+
+- **文件 → 导出 KiCad 原理图 (.kicad_sch)**：给现代 PCB 流程用。KiCad 直接打开这个文件，
+  在元件属性里按实际器件修改封装（导出时填的是 DIP-14 / 单排针占位封装），
+  再执行 **Tools → Update PCB from Schematic（F8）** 同步到 PCB。
+  Altium Designer 可通过 **File → Import Wizard → KiCad Design Files** 导入；
+  立创EDA专业版需经其“格式转换助手”，版本兼容性以实际软件为准。
+- **文件 → 导出旧版网表 (.net)**：只适合旧版 KiCad 5 或作为文本查看/交付材料。
+  现代 KiCad 不读取独立 `.net` 文件。
+
+说明：.kicad_sch 里的符号旋转是按导出时的引脚位置预烘焙的，打开后如果再次旋转元件，
+引脚会和导线脱开，需要重新连线；只做查看和 F8 同步不受影响。
 
 ## 模块边界
 

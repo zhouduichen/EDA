@@ -23,6 +23,7 @@ enum MainFrameCommandId {
     kMenuOpen,
     kMenuSaveProject,
     kMenuExportNetlist,
+    kMenuExportKiCadSchematic,
     kMenuSimulate,
     kMenuExit,
     kMenuUndo,
@@ -57,6 +58,7 @@ private:
     void OnOpen(wxCommandEvent& event);
     void OnSaveProject(wxCommandEvent& event);
     void OnExportNetlist(wxCommandEvent& event);
+    void OnExportKiCadSchematic(wxCommandEvent& event);
     void OnSimulate(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnSelectTool(wxCommandEvent& event);

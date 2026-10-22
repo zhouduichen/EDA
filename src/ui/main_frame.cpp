@@ -13,6 +13,7 @@
 #include <cctype>
 
 #include "src/io/kicad_netlist_exporter.hpp"
+#include "src/io/kicad_schematic_exporter.hpp"
 #include "src/io/project_serializer.hpp"
 #include "src/ui/component_library_panel.hpp"
 #include "src/ui/properties_panel.hpp"
@@ -51,7 +52,9 @@ void MainFrame::BuildMenuBar() {
     menu_file->Append(kMenuNew, L"新建\tCtrl+N");
     menu_file->Append(kMenuOpen, L"打开工程\tCtrl+O");
     menu_file->Append(kMenuSaveProject, L"保存工程\tCtrl+S");
-    menu_file->Append(kMenuExportNetlist, L"导出网表...\tCtrl+E");
+    menu_file->Append(kMenuExportNetlist, L"导出旧版网表 (.net)...\tCtrl+E");
+    menu_file->Append(kMenuExportKiCadSchematic,
+                      L"导出 KiCad 原理图 (.kicad_sch)...\tCtrl+Shift+E");
     menu_file->AppendSeparator();
     menu_file->Append(kMenuExit, L"退出\tAlt+F4");
 
@@ -89,6 +92,7 @@ void MainFrame::BuildMenuBar() {
     Bind(wxEVT_MENU, &MainFrame::OnOpen, this, kMenuOpen);
     Bind(wxEVT_MENU, &MainFrame::OnSaveProject, this, kMenuSaveProject);
     Bind(wxEVT_MENU, &MainFrame::OnExportNetlist, this, kMenuExportNetlist);
+    Bind(wxEVT_MENU, &MainFrame::OnExportKiCadSchematic, this, kMenuExportKiCadSchematic);
     Bind(wxEVT_MENU, &MainFrame::OnSimulate, this, kMenuSimulate);
     Bind(wxEVT_MENU, &MainFrame::OnExit, this, kMenuExit);
     Bind(wxEVT_MENU, &MainFrame::OnUndo, this, kMenuUndo);
@@ -223,6 +227,26 @@ void MainFrame::OnExportNetlist(wxCommandEvent& event) {
     }
     else {
         wxMessageBox(L"导出网表失败：" + wxString(result.message), L"错误",
+                     wxOK | wxICON_ERROR, this);
+    }
+}
+
+void MainFrame::OnExportKiCadSchematic(wxCommandEvent& event) {
+    static_cast<void>(event);
+    wxFileDialog dialog(this, L"导出 KiCad 原理图", wxEmptyString, L"原理图.kicad_sch",
+                        L"KiCad 原理图 (*.kicad_sch)|*.kicad_sch",
+                        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const wxString wx_path = dialog.GetPath();
+    const Result<void> result = io::ExportKiCadSchematic(editor_.GetSnapshot(), library_,
+                                                         wx_path.ToStdString());
+    if (result.ok) {
+        GetStatusBar()->SetStatusText(L"已导出 KiCad 原理图：" + wx_path, 0);
+    }
+    else {
+        wxMessageBox(L"导出 KiCad 原理图失败：" + wxString(result.message), L"错误",
                      wxOK | wxICON_ERROR, this);
     }
 }

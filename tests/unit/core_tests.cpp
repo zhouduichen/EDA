@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,7 @@
 
 #include "src/component/component_factory.hpp"
 #include "src/io/kicad_netlist_exporter.hpp"
+#include "src/io/kicad_schematic_exporter.hpp"
 #include "src/io/project_serializer.hpp"
 #include "src/component/component_library.hpp"
 #include "src/editor/editor_controller.hpp"
@@ -841,6 +843,221 @@ void TestEditorCommandsAndWireWorkflow() {
     assert(editor.GetSnapshot().wires.size() == 1);
 }
 
+    void TestKiCadSchematicExport() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        snapshot.components.push_back(MakeComponent(1, "io.input", "IN1", 0.0, 0.0));
+        snapshot.components.push_back(MakeComponent(2, "logic.not", "U1", 100.0, 0.0));
+        snapshot.components.push_back(MakeComponent(3, "io.output", "OUT1", 300.0, 10.0));
+        cse::ComponentInstance rotated = MakeComponent(4, "logic.and", "U2", 500.0, 200.0);
+        rotated.rotation_deg = 90.0;
+        rotated.properties["label"] = "aux gate";
+        snapshot.components.push_back(rotated);
+
+        snapshot.wires.push_back(
+            MakeWire(1, 1, 1, { 50.0, 15.0 }, 2, 1, { 100.0, 25.0 }));
+        snapshot.wires.push_back(
+            MakeWire(2, 2, 2, { 170.0, 25.0 }, 3, 1, { 300.0, 25.0 }));
+        // 接在旋转后的 AND 引脚 1 上：绝对坐标 (545, 190) → (138.43, 48.26) mm。
+        snapshot.wires.push_back(
+            MakeWire(3, 4, 1, { 545.0, 190.0 }, 0, 0, { 600.0, 190.0 }));
+
+        const std::string path = "cse_test_schematic.kicad_sch";
+        assert(cse::io::ExportKiCadSchematic(snapshot, library, path).ok);
+
+        std::ifstream stream(path, std::ios::binary);
+        assert(stream.is_open());
+        const std::string content((std::istreambuf_iterator<char>(stream)),
+                                  std::istreambuf_iterator<char>());
+        stream.close();
+        std::filesystem::remove(path);
+
+        // 文件头必须是 KiCad 6 格式，更新的 KiCad 打开时会自动升级。
+        assert(content.rfind("(kicad_sch (version 20211123)", 0) == 0);
+        assert(content.find("(lib_symbols") != std::string::npos);
+        assert(content.find("(symbol \"cse:io_input\"") != std::string::npos);
+        assert(content.find("(symbol \"cse:logic_not\"") != std::string::npos);
+        // 旋转后的元件使用预旋转符号，实例本身不再旋转，保证引脚坐标与导线一致。
+        assert(content.find("(symbol \"cse:logic_and_r90\"") != std::string::npos);
+        assert(content.find("(lib_id \"cse:logic_not\")") != std::string::npos);
+        // lib_symbols 用 Y 轴向上，写文件时引脚/矩形要先取反 Y，否则 KiCad 会把元件上下镜像。
+        assert(content.find("(pin input line (at 0.000000 -6.350000 0)") != std::string::npos);
+        assert(content.find("(pin output line (at 17.780000 -6.350000 180)") != std::string::npos);
+        assert(content.find("(pin input line (at 11.430000 2.540000 90)") != std::string::npos);
+        assert(content.find("(rectangle (start 0.000000 -12.700000) (end 17.780000 0.000000)") !=
+               std::string::npos);
+        assert(content.find("(reference \"IN1\")") != std::string::npos);
+        assert(content.find("(reference \"U1\")") != std::string::npos);
+        assert(content.find("(reference \"OUT1\")") != std::string::npos);
+        assert(content.find("(wire (pts") != std::string::npos);
+        assert(content.find("(sheet_instances") != std::string::npos);
+        assert(content.find("(symbol_instances") != std::string::npos);
+        // 旋转后的引脚坐标必须和导线端点一致（预旋转符号 + 实例角度 0）。
+        assert(content.find("(xy 138.430000 48.260000)") != std::string::npos);
+        assert(content.find("(xy 152.400000 48.260000)") != std::string::npos);
+        // 占位封装和自定义 label 也要带过去。
+        assert(content.find("(footprint \"Package_DIP:DIP-14_W7.62mm\")") !=
+               std::string::npos);
+        assert(content.find("(property \"Label\" \"aux gate\"") != std::string::npos);
+
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (char character : content) {
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (character == '\\') {
+                    escaped = true;
+                } else if (character == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (character == '"') {
+                in_string = true;
+            } else if (character == '(') {
+                ++depth;
+            } else if (character == ')') {
+                --depth;
+                assert(depth >= 0);
+            }
+        }
+        assert(depth == 0);
+        assert(!in_string);
+    }
+
+    void TestKiCadSchematicTJunction() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        snapshot.wires.push_back(MakeWire(1, 0, 0, { 0.0, 0.0 }, 0, 0, { 100.0, 0.0 }));
+        snapshot.wires.push_back(MakeWire(2, 0, 0, { 50.0, 0.0 }, 0, 0, { 50.0, 50.0 }));
+
+        const std::string path = "cse_test_schematic_t.cse_sch";
+        assert(cse::io::ExportKiCadSchematic(snapshot, library, path).ok);
+        std::ifstream stream(path, std::ios::binary);
+        assert(stream.is_open());
+        const std::string content((std::istreambuf_iterator<char>(stream)),
+                                  std::istreambuf_iterator<char>());
+        stream.close();
+        std::filesystem::remove(path);
+
+        // 竖线端点落在横线中段 → T 形接点，必须显式写 junction。
+        assert(content.find("(junction (at 12.700000 0.000000)") != std::string::npos);
+    }
+
+    void TestKiCadSchematicRotatedConnection() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        cse::ComponentInstance gate = MakeComponent(1, "logic.and", "U1", 500.0, 200.0);
+        gate.rotation_deg = 90.0;
+        snapshot.components.push_back(gate);
+        snapshot.components.push_back(MakeComponent(2, "io.output", "OUT1", 600.0, 245.0));
+
+        // 旋转 90° 后 AND 的 Y 引脚在 (535, 260)，输出元件引脚在 (600, 260)。
+        snapshot.wires.push_back(
+            MakeWire(1, 1, 3, { 535.0, 260.0 }, 2, 1, { 600.0, 260.0 }));
+
+        const std::string path = "cse_test_schematic_rotated.kicad_sch";
+        assert(cse::io::ExportKiCadSchematic(snapshot, library, path).ok);
+        std::ifstream stream(path, std::ios::binary);
+        assert(stream.is_open());
+        const std::string content((std::istreambuf_iterator<char>(stream)),
+                                  std::istreambuf_iterator<char>());
+        stream.close();
+        std::filesystem::remove(path);
+
+        assert(content.find("(lib_id \"cse:logic_and_r90\")") != std::string::npos);
+        assert(content.find("(xy 135.890000 66.040000)") != std::string::npos);
+        assert(content.find("(xy 152.400000 66.040000)") != std::string::npos);
+    }
+
+    void TestKiCadSchematicRejectsLooseConnection() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        snapshot.wires.push_back(MakeWire(1, 0, 0, { 0.0, 0.0 }, 0, 0, { 100.0, 0.0 }));
+        // 端点离横线 0.2 单位：建网认为相连，KiCad 按精确坐标认为断开。
+        snapshot.wires.push_back(MakeWire(2, 0, 0, { 50.0, 0.2 }, 0, 0, { 50.0, 50.2 }));
+
+        const cse::Result<void> result =
+            cse::io::ExportKiCadSchematic(snapshot, library, "cse_test_schematic_loose.kicad_sch");
+        assert(!result.ok);
+        assert(result.code == cse::ErrorCode::kInvalidConnection);
+    }
+
+    void TestKiCadSchematicValidation() {
+        cse::component::ComponentLibrary library;
+        const std::string path = "cse_test_schematic_validation.kicad_sch";
+
+        // 空工程也能导出。
+        cse::SchematicSnapshot empty;
+        assert(cse::io::ExportKiCadSchematic(empty, library, path).ok);
+        std::filesystem::remove(path);
+
+        cse::SchematicSnapshot unknown;
+        unknown.components.push_back(MakeComponent(1, "logic.nand", "U1", 0.0, 0.0));
+        const cse::Result<void> unknown_result =
+            cse::io::ExportKiCadSchematic(unknown, library, path);
+        assert(!unknown_result.ok);
+        assert(unknown_result.code == cse::ErrorCode::kInvalidComponent);
+
+        cse::SchematicSnapshot duplicate;
+        duplicate.components.push_back(MakeComponent(1, "logic.and", "U1", 0.0, 0.0));
+        duplicate.components.push_back(MakeComponent(2, "logic.or", "U1", 100.0, 0.0));
+        const cse::Result<void> duplicate_result =
+            cse::io::ExportKiCadSchematic(duplicate, library, path);
+        assert(!duplicate_result.ok);
+        assert(duplicate_result.code == cse::ErrorCode::kInvalidArgument);
+
+        cse::SchematicSnapshot bad_reference;
+        bad_reference.components.push_back(MakeComponent(1, "logic.and", "1U", 0.0, 0.0));
+        const cse::Result<void> bad_reference_result =
+            cse::io::ExportKiCadSchematic(bad_reference, library, path);
+        assert(!bad_reference_result.ok);
+        assert(bad_reference_result.code == cse::ErrorCode::kInvalidArgument);
+    }
+
+    void TestKiCadSchematicExportsComposite() {
+        cse::component::ComponentLibrary library;
+        auto module = std::make_shared<cse::CompositeModule>();
+        module->definition.type_id = "custom.inverter";
+        module->definition.display_name = "Inverter";
+        module->definition.category = "custom";
+        module->definition.default_bounds = { 0.0, 0.0, 100.0, 40.0 };
+        module->definition.pins = {
+            cse::PinDefinition{ 1, "IN", cse::PinDirection::kInput, { 0.0, 15.0 } },
+            cse::PinDefinition{ 2, "OUT", cse::PinDirection::kOutput, { 100.0, 15.0 } },
+        };
+        module->inputs.push_back(cse::CompositePortMapping{ 1, 1, 1 });
+        module->outputs.push_back(cse::CompositePortMapping{ 2, 1, 2 });
+        assert(library.RegisterComposite(module).ok);
+
+        cse::SchematicSnapshot snapshot;
+        snapshot.components.push_back(MakeComponent(1, "io.input", "IN1", 0.0, 0.0));
+        snapshot.components.push_back(MakeComponent(2, "custom.inverter", "U1", 100.0, 0.0));
+        snapshot.components.push_back(MakeComponent(3, "io.output", "OUT1", 300.0, 0.0));
+        snapshot.wires.push_back(MakeWire(1, 1, 1, { 50.0, 15.0 }, 2, 1, { 100.0, 15.0 }));
+        snapshot.wires.push_back(MakeWire(2, 2, 2, { 200.0, 15.0 }, 3, 1, { 300.0, 15.0 }));
+
+        const std::string path = "cse_test_schematic_composite.kicad_sch";
+        assert(cse::io::ExportKiCadSchematic(snapshot, library, path).ok);
+        std::ifstream stream(path, std::ios::binary);
+        assert(stream.is_open());
+        const std::string content((std::istreambuf_iterator<char>(stream)),
+                                  std::istreambuf_iterator<char>());
+        stream.close();
+        std::filesystem::remove(path);
+
+        // 自定义元件作为一种普通符号导出；内部实现不展开。
+        assert(content.find("(symbol \"cse:custom_inverter\"") != std::string::npos);
+        assert(content.find("(lib_id \"cse:custom_inverter\")") != std::string::npos);
+        assert(content.find("(pin input line (at 0.000000 -3.810000 0)") !=
+               std::string::npos);
+        assert(content.find("(pin output line (at 25.400000 -3.810000 180)") !=
+               std::string::npos);
+        assert(content.find("(reference \"U1\")") != std::string::npos);
+    }
+
 }  // namespace
 
 int main() {
@@ -865,5 +1082,11 @@ int main() {
     TestWirePolylineRepairsAfterMove();
     TestLoadSnapshotIntegration();
     TestKiCadNetlistExport();
+    TestKiCadSchematicExport();
+    TestKiCadSchematicTJunction();
+    TestKiCadSchematicRotatedConnection();
+    TestKiCadSchematicRejectsLooseConnection();
+    TestKiCadSchematicValidation();
+    TestKiCadSchematicExportsComposite();
     return 0;
 }

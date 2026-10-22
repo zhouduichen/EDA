@@ -21,6 +21,14 @@ Point2D ClosestPointOnSegment(Point2D point, Point2D start, Point2D end);
 Point2D ResolveWireEndpoint(const SchematicSnapshot& snapshot, const IComponentLibrary& library,
                             const WireEndpoint& endpoint);
 
+// 单个引脚在画布坐标系中的绝对位置（含元件旋转）。画布、建网和导出共用同一套公式，
+// 避免"看到的引脚"和"导出文件里的引脚"落在不同位置。
+Point2D PinAbsolutePosition(const ComponentInstance& component,
+                            const ComponentDefinition& definition, const PinDefinition& pin);
+
+// 元件旋转后的外接矩形，坐标相对元件 position。导出 KiCad 符号时用来画符号外形。
+Rect2D RotatedComponentBounds(const ComponentDefinition& definition, double rotation_deg);
+
 // 规划一条只走水平/垂直方向的正交走线，返回不含两端点的中间拐点（空 = 两点已经对齐，
 // 直线本身就是正交的）。
 // 为什么不是"算个拐点就完事"：两个引脚不一定同列同行，随便挑一个拐点很容易正好压在
