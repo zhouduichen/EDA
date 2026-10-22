@@ -35,6 +35,7 @@ enum MainFrameCommandId {
     kMenuZoomIn,
     kMenuZoomOut,
     kMenuFit,
+    kMenuCreateComposite,
     kToolbarSelect,
     kToolbarWire,
     kToolbarPan,
@@ -63,6 +64,7 @@ private:
     void OnPanTool(wxCommandEvent& event);
     void OnRotate(wxCommandEvent& event);
     void OnDelete(wxCommandEvent& event);
+    void OnCreateComposite(wxCommandEvent& event);
     void OnUndo(wxCommandEvent& event);
     void OnRedo(wxCommandEvent& event);
     void OnZoomIn(wxCommandEvent& event);

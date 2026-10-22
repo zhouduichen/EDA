@@ -42,6 +42,10 @@ void ComponentLibraryPanel::SetComponentActivatedHandler(ComponentActivatedHandl
     component_activated_handler_ = std::move(handler);
 }
 
+void ComponentLibraryPanel::RefreshLibrary() {
+    PopulateTree();
+}
+
 void ComponentLibraryPanel::PopulateTree() {
     tree_component_library_->DeleteAllItems();
     const wxTreeItemId root = tree_component_library_->AddRoot(L"元件库");

@@ -15,14 +15,16 @@ namespace cse::io {
     namespace {
 
         constexpr const char* kMagic = "CSEPROJ";
-        // 当前写入版本。没有拐点的工程仍写成 v1，这样旧版本程序还能打开；
-        // 出现拐点（ROUTE 段）才升到 v2。
-        constexpr int kFormatVersion = 2;
+        // v2 增加导线拐点，v3 增加自定义组合元件定义。
+        constexpr int kFormatVersion = 3;
         constexpr int kMinSupportedVersion = 1;
         // 畸形文件里 ROUTE 数量可能是任意大数，先拦一道，避免按声明开数组。
         constexpr std::size_t kMaxRoutePoints = 10000;
 
         int VersionFor(const SchematicSnapshot& snapshot) {
+            if (!snapshot.composite_modules.empty()) {
+                return 3;
+            }
             for (const WireModel& wire : snapshot.wires) {
                 if (!wire.route_points.empty()) {
                     return 2;
@@ -205,12 +207,83 @@ namespace cse::io {
                     }
                 }
             }
+            std::unordered_set<std::string> module_ids;
+            for (const auto& module : snapshot.composite_modules) {
+                if (module == nullptr || module->definition.type_id.empty() ||
+                    module->definition.type_id.rfind("custom.", 0) != 0 ||
+                    module->definition.display_name.empty() ||
+                    module->definition.category != "custom" ||
+                    !std::isfinite(module->definition.default_bounds.width) ||
+                    !std::isfinite(module->definition.default_bounds.height) ||
+                    module->definition.default_bounds.width <= 0.0 ||
+                    module->definition.default_bounds.height <= 0.0 ||
+                    !module_ids.insert(module->definition.type_id).second ||
+                    module->inputs.empty() || module->outputs.empty() ||
+                    module->implementation.components.empty()) {
+                    return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                 "invalid or duplicate composite module");
+                }
+                const Result<void> inner_validation = ValidateSnapshot(module->implementation);
+                if (!inner_validation.ok || !module->implementation.composite_modules.empty()) {
+                    return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                 "invalid nested composite implementation");
+                }
+                std::unordered_set<PinId> module_pin_ids;
+                for (const PinDefinition& pin : module->definition.pins) {
+                    if (pin.local_id == 0 || pin.name.empty() ||
+                        !module_pin_ids.insert(pin.local_id).second ||
+                        (pin.direction != PinDirection::kInput &&
+                         pin.direction != PinDirection::kOutput) ||
+                        !std::isfinite(pin.relative_position.x) ||
+                        !std::isfinite(pin.relative_position.y)) {
+                        return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                     "invalid composite pin");
+                    }
+                }
+                std::unordered_set<PinId> mapped_pins;
+                std::unordered_set<ComponentId> inner_component_ids;
+                for (const ComponentInstance& component : module->implementation.components) {
+                    if (component.type_id.rfind("custom.", 0) == 0) {
+                        return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                     "nested composites are unsupported");
+                    }
+                    inner_component_ids.insert(component.id);
+                }
+                const auto validate_mappings = [&](const std::vector<CompositePortMapping>& mappings,
+                                                   PinDirection direction) {
+                    for (const CompositePortMapping& mapping : mappings) {
+                        const auto external_pin = std::find_if(
+                            module->definition.pins.begin(), module->definition.pins.end(),
+                            [&mapping](const PinDefinition& pin) {
+                                return pin.local_id == mapping.external_pin_id;
+                            });
+                        if (external_pin == module->definition.pins.end() ||
+                            external_pin->direction != direction ||
+                            !mapped_pins.insert(mapping.external_pin_id).second ||
+                            inner_component_ids.count(mapping.internal_component_id) == 0 ||
+                            mapping.internal_pin_id == 0) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                if (!validate_mappings(module->inputs, PinDirection::kInput) ||
+                    !validate_mappings(module->outputs, PinDirection::kOutput) ||
+                    mapped_pins.size() != module->definition.pins.size()) {
+                    return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                 "invalid composite port mapping");
+                }
+            }
             return Result<void>::Success();
         }
 
     }  // namespace
 
     Result<void> SaveProject(const SchematicSnapshot& snapshot, const std::string& path) {
+        const Result<void> validation = ValidateSnapshot(snapshot);
+        if (!validation.ok) {
+            return validation;
+        }
         std::ofstream stream(path, std::ios::binary);
         if (!stream.is_open()) {
             return Result<void>::Failure(ErrorCode::kFileOpenFailed,
@@ -219,20 +292,19 @@ namespace cse::io {
 
         stream << kMagic << ' ' << VersionFor(snapshot) << '\n';
 
-        for (const ComponentInstance& component : snapshot.components) {
+        auto write_component = [&stream](const ComponentInstance& component) {
             stream << "COMP " << component.id << ' ' << component.type_id << ' '
-                << component.reference << ' ' << FormatDouble(component.position.x) << ' '
-                << FormatDouble(component.position.y) << ' '
-                << FormatDouble(component.rotation_deg);
+                   << component.reference << ' ' << FormatDouble(component.position.x) << ' '
+                   << FormatDouble(component.position.y) << ' '
+                   << FormatDouble(component.rotation_deg);
             for (const auto& [key, value] : SortedProperties(component.properties)) {
                 stream << ' ' << key << '=' << FormatPropertyValue(value);
             }
             stream << '\n';
-        }
-
-        for (const WireModel& wire : snapshot.wires) {
+        };
+        auto write_wire = [&stream](const WireModel& wire) {
             stream << "WIRE " << wire.id << ' ' << FormatEndpoint(wire.from) << ' '
-                << FormatEndpoint(wire.to);
+                   << FormatEndpoint(wire.to);
             if (!wire.route_points.empty()) {
                 stream << " ROUTE " << wire.route_points.size();
                 for (const Point2D& point : wire.route_points) {
@@ -240,6 +312,46 @@ namespace cse::io {
                 }
             }
             stream << '\n';
+        };
+
+        for (const auto& module : snapshot.composite_modules) {
+            if (module == nullptr) {
+                continue;
+            }
+            const ComponentDefinition& definition = module->definition;
+            stream << "MODULE " << std::quoted(definition.type_id) << ' '
+                   << std::quoted(definition.display_name) << ' '
+                   << FormatDouble(definition.default_bounds.width) << ' '
+                   << FormatDouble(definition.default_bounds.height) << '\n';
+            for (const PinDefinition& pin : definition.pins) {
+                stream << "MPIN " << pin.local_id << ' ' << static_cast<int>(pin.direction)
+                       << ' ' << std::quoted(pin.name) << ' '
+                       << FormatDouble(pin.relative_position.x) << ' '
+                       << FormatDouble(pin.relative_position.y) << '\n';
+            }
+            for (const CompositePortMapping& mapping : module->inputs) {
+                stream << "INMAP " << mapping.external_pin_id << ' '
+                       << mapping.internal_component_id << ' ' << mapping.internal_pin_id << '\n';
+            }
+            for (const CompositePortMapping& mapping : module->outputs) {
+                stream << "OUTMAP " << mapping.external_pin_id << ' '
+                       << mapping.internal_component_id << ' ' << mapping.internal_pin_id << '\n';
+            }
+            for (const ComponentInstance& component : module->implementation.components) {
+                write_component(component);
+            }
+            for (const WireModel& wire : module->implementation.wires) {
+                write_wire(wire);
+            }
+            stream << "ENDMODULE\n";
+        }
+
+        for (const ComponentInstance& component : snapshot.components) {
+            write_component(component);
+        }
+
+        for (const WireModel& wire : snapshot.wires) {
+            write_wire(wire);
         }
 
         stream << "END\n";
@@ -277,6 +389,7 @@ namespace cse::io {
         }
 
         SchematicSnapshot snapshot;
+        std::shared_ptr<CompositeModule> current_module;
         bool found_end = false;
         int line_number = 1;
         while (std::getline(stream, line)) {
@@ -289,7 +402,65 @@ namespace cse::io {
             if (!(row >> tag)) {
                 continue;
             }
+            if (tag == "MODULE") {
+                if (current_module != nullptr) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "nested MODULE at line " + std::to_string(line_number));
+                }
+                current_module = std::make_shared<CompositeModule>();
+                current_module->definition.category = "custom";
+                if (!(row >> std::quoted(current_module->definition.type_id)
+                          >> std::quoted(current_module->definition.display_name)
+                          >> current_module->definition.default_bounds.width
+                          >> current_module->definition.default_bounds.height)) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "bad MODULE record at line " + std::to_string(line_number));
+                }
+                continue;
+            }
+            if (tag == "ENDMODULE") {
+                if (current_module == nullptr) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "unexpected ENDMODULE at line " + std::to_string(line_number));
+                }
+                snapshot.composite_modules.push_back(current_module);
+                current_module.reset();
+                continue;
+            }
+            if (tag == "MPIN") {
+                PinDefinition pin;
+                int direction = -1;
+                if (current_module == nullptr ||
+                    !(row >> pin.local_id >> direction >> std::quoted(pin.name)
+                          >> pin.relative_position.x >> pin.relative_position.y) ||
+                    (direction != static_cast<int>(PinDirection::kInput) &&
+                     direction != static_cast<int>(PinDirection::kOutput))) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "bad MPIN record at line " + std::to_string(line_number));
+                }
+                pin.direction = static_cast<PinDirection>(direction);
+                current_module->definition.pins.push_back(std::move(pin));
+                continue;
+            }
+            if (tag == "INMAP" || tag == "OUTMAP") {
+                CompositePortMapping mapping;
+                if (current_module == nullptr ||
+                    !(row >> mapping.external_pin_id >> mapping.internal_component_id
+                          >> mapping.internal_pin_id) || mapping.external_pin_id == 0 ||
+                    mapping.internal_component_id == kInvalidComponentId ||
+                    mapping.internal_pin_id == 0) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "bad port mapping at line " + std::to_string(line_number));
+                }
+                (tag == "INMAP" ? current_module->inputs : current_module->outputs)
+                    .push_back(mapping);
+                continue;
+            }
             if (tag == "END") {
+                if (current_module != nullptr) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "missing ENDMODULE before END");
+                }
                 found_end = true;
                 break;
             }
@@ -318,7 +489,11 @@ namespace cse::io {
                     }
                     component.properties[token.substr(0, equals)] = token.substr(equals + 1);
                 }
-                snapshot.components.push_back(std::move(component));
+                if (current_module != nullptr) {
+                    current_module->implementation.components.push_back(std::move(component));
+                } else {
+                    snapshot.components.push_back(std::move(component));
+                }
             }
             else if (tag == "WIRE") {
                 WireModel wire;
@@ -368,7 +543,11 @@ namespace cse::io {
                             "extra WIRE field at line " + std::to_string(line_number));
                     }
                 }
-                snapshot.wires.push_back(std::move(wire));
+                if (current_module != nullptr) {
+                    current_module->implementation.wires.push_back(std::move(wire));
+                } else {
+                    snapshot.wires.push_back(std::move(wire));
+                }
             }
             else {
                 return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,

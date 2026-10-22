@@ -19,6 +19,7 @@ public:
     ComponentLibraryPanel(wxWindow* parent, const IComponentLibrary& library);
 
     void SetComponentActivatedHandler(ComponentActivatedHandler handler);
+    void RefreshLibrary();
 
 private:
     void PopulateTree();

@@ -218,9 +218,13 @@ void SchematicCanvas::OnMouseLeftDown(wxMouseEvent& event) {
     if (component_id.has_value()) {
         const std::optional<ComponentInstance> component = editor_.GetComponent(*component_id);
         if (component.has_value()) {
-            editor_.SelectComponent(*component_id);
-            BeginComponentDrag(*component_id, last_mouse_model_);
-            CaptureMouse();
+            if (event.ShiftDown()) {
+                editor_.ToggleComponentSelection(*component_id);
+            } else {
+                editor_.SelectComponent(*component_id);
+                BeginComponentDrag(*component_id, last_mouse_model_);
+                CaptureMouse();
+            }
         }
     } else {
         const std::optional<WireId> wire_id = HitWire(last_mouse_model_);
@@ -792,7 +796,10 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
         }
         dc.SetPen(wxPen(selected ? wxColour(210, 75, 60) : wxColour(55, 65, 80),
                         selected ? 3 : 2));
-        if (component.type_id == "io.input") {
+        if (definition->category == "custom") {
+            dc.SetBrush(wxBrush(wxColour(237, 232, 250)));
+            dc.DrawRectangle(top_left.x, top_left.y, width, height);
+        } else if (component.type_id == "io.input") {
             dc.SetBrush(wxBrush(wxColour(224, 240, 252)));
             dc.DrawRectangle(top_left.x, top_left.y, width, height);
             dc.DrawLine(top_left.x + width - 14, top_left.y + height / 2,

@@ -7,7 +7,10 @@
 #include <wx/sizer.h>
 #include <wx/splitter.h>
 #include <wx/statusbr.h>
+#include <wx/textdlg.h>
 #include <wx/toolbar.h>
+
+#include <cctype>
 
 #include "src/io/kicad_netlist_exporter.hpp"
 #include "src/io/project_serializer.hpp"
@@ -57,6 +60,7 @@ void MainFrame::BuildMenuBar() {
     menu_edit->Append(kMenuRedo, L"重做\tCtrl+Y");
     menu_edit->AppendSeparator();
     menu_edit->Append(kMenuDelete, L"删除\tDelete");
+    menu_edit->Append(kMenuCreateComposite, L"将选区创建为自定义元件...");
 
     auto* menu_tool = new wxMenu();
     menu_tool->AppendRadioItem(kMenuSelectTool, L"选择\tS");
@@ -90,6 +94,7 @@ void MainFrame::BuildMenuBar() {
     Bind(wxEVT_MENU, &MainFrame::OnUndo, this, kMenuUndo);
     Bind(wxEVT_MENU, &MainFrame::OnRedo, this, kMenuRedo);
     Bind(wxEVT_MENU, &MainFrame::OnDelete, this, kMenuDelete);
+    Bind(wxEVT_MENU, &MainFrame::OnCreateComposite, this, kMenuCreateComposite);
     Bind(wxEVT_MENU, &MainFrame::OnSelectTool, this, kMenuSelectTool);
     Bind(wxEVT_MENU, &MainFrame::OnWireTool, this, kMenuWireTool);
     Bind(wxEVT_MENU, &MainFrame::OnPanTool, this, kMenuPanTool);
@@ -269,6 +274,51 @@ void MainFrame::OnDelete(wxCommandEvent& event) {
     static_cast<void>(event);
     static_cast<void>(editor_.DeleteSelection());
     RefreshViews();
+}
+
+void MainFrame::OnCreateComposite(wxCommandEvent& event) {
+    static_cast<void>(event);
+    wxTextEntryDialog dialog(this, L"输入自定义元件显示名称：", L"创建自定义元件", L"My Circuit");
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const wxString display_name = dialog.GetValue().Trim();
+    if (display_name.empty()) {
+        return;
+    }
+    std::string slug;
+    const std::string utf8_name = display_name.ToStdString();
+    bool previous_separator = false;
+    for (unsigned char character : utf8_name) {
+        if (std::isalnum(character) != 0) {
+            slug.push_back(static_cast<char>(std::tolower(character)));
+            previous_separator = false;
+        } else if (!slug.empty() && !previous_separator) {
+            slug.push_back('_');
+            previous_separator = true;
+        }
+    }
+    while (!slug.empty() && slug.back() == '_') {
+        slug.pop_back();
+    }
+    if (slug.empty()) {
+        slug = "module";
+    }
+    std::string type_id = "custom." + slug;
+    unsigned int suffix = 2;
+    while (library_.FindByTypeId(type_id).has_value()) {
+        type_id = "custom." + slug + "_" + std::to_string(suffix++);
+    }
+    const Result<ComponentId> result =
+        editor_.CreateComposite(type_id, display_name.ToStdString());
+    if (!result.ok) {
+        wxMessageBox(L"创建自定义元件失败：" + wxString::FromUTF8(result.message),
+                     L"创建失败", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    panel_component_library_->RefreshLibrary();
+    panel_canvas_->SetFocus();
+    GetStatusBar()->SetStatusText(L"已创建自定义元件：" + display_name, 0);
 }
 
 void MainFrame::OnUndo(wxCommandEvent& event) {

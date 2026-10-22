@@ -130,6 +130,34 @@ SimulationResult RunSimulation(const SchematicSnapshot& snapshot,
                 continue;
             }
 
+            const std::shared_ptr<const CompositeModule> composite =
+                library.FindComposite(component.type_id);
+            if (composite != nullptr) {
+                std::unordered_map<ComponentId, LogicValue> inner_inputs;
+                for (const CompositePortMapping& mapping : composite->inputs) {
+                    const auto net_iterator = pin_net.find(
+                        PinKey(component.id, mapping.external_pin_id));
+                    inner_inputs[mapping.internal_component_id] =
+                        net_iterator != pin_net.end() ? values[net_iterator->second]
+                                                      : LogicValue::kUnknown;
+                }
+                const SimulationResult inner = RunSimulation(
+                    composite->implementation, library, inner_inputs);
+                for (const CompositePortMapping& mapping : composite->outputs) {
+                    const auto external_net = pin_net.find(
+                        PinKey(component.id, mapping.external_pin_id));
+                    const auto internal_value = inner.pin_values.find(
+                        PinKey(mapping.internal_component_id, mapping.internal_pin_id));
+                    if (external_net != pin_net.end()) {
+                        drives.push_back({external_net->second,
+                                          internal_value != inner.pin_values.end()
+                                              ? internal_value->second
+                                              : LogicValue::kUnknown});
+                    }
+                }
+                continue;
+            }
+
             if (definition->category != "logic") {
                 continue;
             }

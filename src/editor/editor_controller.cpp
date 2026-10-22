@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "src/editor/editor_commands.hpp"
@@ -25,7 +28,7 @@ Point2D WireAnchor(const PendingWire& pending_wire) {
 
 }  // namespace
 
-EditorController::EditorController(model::SchematicModel& model, const IComponentLibrary& library,
+EditorController::EditorController(model::SchematicModel& model, IComponentLibrary& library,
                                    IComponentFactory& factory)
     : model_(model), library_(library), factory_(factory) {}
 
@@ -83,6 +86,179 @@ void EditorController::SelectComponent(std::optional<ComponentId> component_id) 
     }
     selection_ = std::move(next_selection);
     NotifySelectionChanged();
+}
+
+void EditorController::ToggleComponentSelection(ComponentId component_id) {
+    if (!model_.ContainsComponent(component_id)) {
+        return;
+    }
+    SelectionState next = selection_;
+    next.wire_ids.clear();
+    const auto iterator = std::find(next.component_ids.begin(), next.component_ids.end(), component_id);
+    if (iterator == next.component_ids.end()) {
+        next.component_ids.push_back(component_id);
+        std::sort(next.component_ids.begin(), next.component_ids.end());
+    } else {
+        next.component_ids.erase(iterator);
+    }
+    if (next.component_ids != selection_.component_ids || next.wire_ids != selection_.wire_ids) {
+        selection_ = std::move(next);
+        NotifySelectionChanged();
+    }
+}
+
+Result<ComponentId> EditorController::CreateComposite(std::string type_id,
+                                                       std::string display_name) {
+    if (selection_.component_ids.empty()) {
+        return Result<ComponentId>::Failure(ErrorCode::kInvalidArgument,
+                                             "请先选择要封装的电路元件");
+    }
+    if (type_id.empty() || display_name.empty()) {
+        return Result<ComponentId>::Failure(ErrorCode::kInvalidArgument,
+                                             "元件名称和类型标识不能为空");
+    }
+
+    const SchematicSnapshot source = model_.GetSnapshot();
+    std::unordered_set<ComponentId> selected(selection_.component_ids.begin(),
+                                              selection_.component_ids.end());
+    auto module = std::make_shared<CompositeModule>();
+    module->definition.type_id = std::move(type_id);
+    module->definition.display_name = std::move(display_name);
+    module->definition.category = "custom";
+
+    std::vector<ComponentInstance> inputs;
+    std::vector<ComponentInstance> outputs;
+    Point2D top_left{std::numeric_limits<double>::max(), std::numeric_limits<double>::max()};
+    double max_right = 0.0;
+    double max_bottom = 0.0;
+    for (const ComponentInstance& component : source.components) {
+        if (selected.count(component.id) == 0) {
+            continue;
+        }
+        if (component.type_id == "io.input") {
+            inputs.push_back(component);
+        } else if (component.type_id == "io.output") {
+            outputs.push_back(component);
+        } else if (library_.FindComposite(component.type_id) != nullptr) {
+            return Result<ComponentId>::Failure(ErrorCode::kInvalidComponent,
+                                                 "首版暂不支持封装内嵌套自定义元件");
+        }
+        const auto definition = library_.FindByTypeId(component.type_id);
+        if (!definition.has_value()) {
+            return Result<ComponentId>::Failure(ErrorCode::kNotFound,
+                                                 "选区包含元件库中不存在的元件类型");
+        }
+        top_left.x = std::min(top_left.x, component.position.x);
+        top_left.y = std::min(top_left.y, component.position.y);
+        max_right = std::max(max_right, component.position.x + definition->default_bounds.width);
+        max_bottom = std::max(max_bottom, component.position.y + definition->default_bounds.height);
+        module->implementation.components.push_back(component);
+    }
+    if (inputs.empty() || outputs.empty()) {
+        return Result<ComponentId>::Failure(ErrorCode::kInvalidComponent,
+                                             "选区至少需要一个 Input 和一个 Output 元件作为端口");
+    }
+
+    auto by_position = [](const ComponentInstance& first, const ComponentInstance& second) {
+        return first.position.y != second.position.y ? first.position.y < second.position.y
+                                                     : first.position.x < second.position.x;
+    };
+    std::sort(inputs.begin(), inputs.end(), by_position);
+    std::sort(outputs.begin(), outputs.end(), by_position);
+
+    const double pin_step = 20.0;
+    const std::size_t rows = std::max(inputs.size(), outputs.size());
+    module->definition.default_bounds = {0.0, 0.0, 100.0,
+                                         std::max(40.0, 20.0 * rows + 10.0)};
+    PinId external_pin = 1;
+    auto add_ports = [&](const std::vector<ComponentInstance>& ports, PinDirection direction,
+                         std::vector<CompositePortMapping>& mappings, double x) -> bool {
+        for (std::size_t index = 0; index < ports.size(); ++index) {
+            const ComponentInstance& instance = ports[index];
+            const auto definition = library_.FindByTypeId(instance.type_id);
+            if (!definition.has_value()) {
+                return false;
+            }
+            const auto internal_pin = std::find_if(
+                definition->pins.begin(), definition->pins.end(), [direction](const PinDefinition& pin) {
+                    return pin.direction == (direction == PinDirection::kInput
+                                                 ? PinDirection::kOutput
+                                                 : PinDirection::kInput);
+                });
+            if (internal_pin == definition->pins.end()) {
+                return false;
+            }
+            const auto label = instance.properties.find("label");
+            const std::string pin_name = label != instance.properties.end() && !label->second.empty()
+                                             ? label->second
+                                             : instance.reference;
+            const Point2D relative{x, 15.0 + pin_step * index};
+            module->definition.pins.push_back(
+            PinDefinition{external_pin, pin_name, direction, relative});
+            mappings.push_back({external_pin, instance.id, internal_pin->local_id});
+            ++external_pin;
+        }
+        return true;
+    };
+    if (!add_ports(inputs, PinDirection::kInput, module->inputs, 0.0) ||
+        !add_ports(outputs, PinDirection::kOutput, module->outputs,
+                   module->definition.default_bounds.width)) {
+        return Result<ComponentId>::Failure(ErrorCode::kInvalidComponent,
+                                             "Input/Output 元件缺少有效方向引脚");
+    }
+
+    for (const WireModel& wire : source.wires) {
+        const bool from_selected = wire.from.pin.has_value() &&
+                                   selected.count(wire.from.pin->component_id) != 0;
+        const bool to_selected = wire.to.pin.has_value() &&
+                                 selected.count(wire.to.pin->component_id) != 0;
+        if (!from_selected && !to_selected) {
+            continue;
+        }
+        if ((wire.from.pin.has_value() && !from_selected) ||
+            (wire.to.pin.has_value() && !to_selected)) {
+            return Result<ComponentId>::Failure(ErrorCode::kInvalidConnection,
+                                                 "有导线连接到选区外，请先断开跨界连线");
+        }
+        if (!wire.from.pin.has_value() || !wire.to.pin.has_value()) {
+            return Result<ComponentId>::Failure(ErrorCode::kInvalidConnection,
+                                                 "封装电路的每根导线都必须连接两个选区内引脚");
+        }
+        module->implementation.wires.push_back(wire);
+    }
+
+    module->definition.category = "custom";
+    const Result<void> registered = library_.RegisterComposite(module);
+    if (!registered.ok) {
+        return Result<ComponentId>::Failure(registered.code, registered.message);
+    }
+
+    const Point2D center{(top_left.x + max_right) / 2.0, (top_left.y + max_bottom) / 2.0};
+    const auto created = factory_.Create(module->definition.type_id, SnapToGrid(center));
+    if (!created.ok) {
+        return Result<ComponentId>::Failure(created.code, created.message);
+    }
+    SchematicSnapshot replacement = GetSnapshot();
+    replacement.components.erase(
+        std::remove_if(replacement.components.begin(), replacement.components.end(),
+                       [&selected](const ComponentInstance& component) {
+                           return selected.count(component.id) != 0;
+                       }),
+        replacement.components.end());
+    replacement.wires.erase(
+        std::remove_if(replacement.wires.begin(), replacement.wires.end(),
+                       [&selected](const WireModel& wire) {
+                           return (wire.from.pin.has_value() &&
+                                   selected.count(wire.from.pin->component_id) != 0) ||
+                                  (wire.to.pin.has_value() &&
+                                   selected.count(wire.to.pin->component_id) != 0);
+                       }),
+        replacement.wires.end());
+    replacement.components.push_back(created.value);
+    replacement.composite_modules.push_back(module);
+    LoadSnapshot(replacement);
+    SelectComponent(created.value.id);
+    return Result<ComponentId>::Success(created.value.id);
 }
 
 void EditorController::SelectWire(std::optional<WireId> wire_id) {
@@ -319,12 +495,26 @@ bool EditorController::CanRedo() const {
 }
 
 SchematicSnapshot EditorController::GetSnapshot() const {
-    return model_.GetSnapshot();
+    SchematicSnapshot snapshot = model_.GetSnapshot();
+    snapshot.composite_modules.clear();
+    for (const ComponentDefinition& definition : library_.GetAll()) {
+        const auto module = library_.FindComposite(definition.type_id);
+        if (module != nullptr) {
+            snapshot.composite_modules.push_back(
+                std::const_pointer_cast<CompositeModule>(module));
+        }
+    }
+    return snapshot;
 }
 
 // 整体替换模型内容，用于打开工程文件。替换是破坏性的：
 // 撤销/重做栈和选区一起清空，历史对不上新图。
 void EditorController::LoadSnapshot(const SchematicSnapshot& snapshot) {
+    for (const auto& module : snapshot.composite_modules) {
+        if (module != nullptr && library_.FindComposite(module->definition.type_id) == nullptr) {
+            static_cast<void>(library_.RegisterComposite(std::make_shared<CompositeModule>(*module)));
+        }
+    }
     pending_wire_.reset();
     selection_ = {};
     undo_stack_.clear();

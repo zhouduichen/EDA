@@ -107,6 +107,27 @@ std::optional<ComponentDefinition> ComponentLibrary::FindByTypeId(
     return iterator->second;
 }
 
+std::shared_ptr<const CompositeModule> ComponentLibrary::FindComposite(
+    const std::string& type_id) const {
+    const auto iterator = composites_.find(type_id);
+    return iterator == composites_.end() ? nullptr : iterator->second;
+}
+
+Result<void> ComponentLibrary::RegisterComposite(std::shared_ptr<CompositeModule> module) {
+    if (module == nullptr || module->inputs.empty() || module->outputs.empty() ||
+        module->definition.category != "custom") {
+        return Result<void>::Failure(ErrorCode::kInvalidComponent,
+                                     "composite module is missing required metadata or ports");
+    }
+    const std::string type_id = module->definition.type_id;
+    const Result<void> registered = Register(module->definition);
+    if (!registered.ok) {
+        return registered;
+    }
+    composites_.emplace(type_id, std::move(module));
+    return Result<void>::Success();
+}
+
 void ComponentLibrary::RegisterBuiltIns() {
     const std::vector<ComponentDefinition> built_ins = {
         Gate("logic.and", "AND", {

@@ -11,6 +11,7 @@
 #include "contracts/component_library.hpp"
 #include "contracts/editor_query.hpp"
 #include "contracts/events.hpp"
+#include "contracts/result.hpp"
 namespace cse::model {
 class SchematicModel;
 }
@@ -29,7 +30,7 @@ public:
     using ModelChangedHandler = std::function<void(const ModelChangedEvent&)>;
     using SelectionChangedHandler = std::function<void(const SelectionChangedEvent&)>;
 
-    EditorController(model::SchematicModel& model, const IComponentLibrary& library,
+    EditorController(model::SchematicModel& model, IComponentLibrary& library,
                      IComponentFactory& factory);
 
     void SetToolMode(ToolMode mode);
@@ -39,7 +40,9 @@ public:
 
     bool PlaceComponent(Point2D position);
     void SelectComponent(std::optional<ComponentId> component_id);
+    void ToggleComponentSelection(ComponentId component_id);
     void SelectWire(std::optional<WireId> wire_id);
+    Result<ComponentId> CreateComposite(std::string type_id, std::string display_name);
     bool MoveComponent(ComponentId component_id, Point2D position);
     bool RotateSelected();
     bool DeleteSelection();
@@ -80,7 +83,7 @@ private:
     CommandId NextCommandId();
 
     model::SchematicModel& model_;
-    const IComponentLibrary& library_;
+    IComponentLibrary& library_;
     IComponentFactory& factory_;
     ToolMode tool_mode_{ToolMode::kSelect};
     std::string placement_type_;

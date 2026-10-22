@@ -101,6 +101,79 @@ namespace {
         std::filesystem::remove(duplicate_id_path);
     }
 
+    cse::ComponentInstance MakeComponent(cse::ComponentId id, const std::string& type_id,
+                                         const std::string& reference, double x, double y);
+    cse::WireModel MakeWire(cse::WireId id, cse::ComponentId from_comp,
+                            cse::PinId from_pin, cse::Point2D from_pos,
+                            cse::ComponentId to_comp, cse::PinId to_pin,
+                            cse::Point2D to_pos);
+
+    void TestCompositeComponentSimulationAndPersistence() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId inner_input = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("logic.not");
+        assert(editor.PlaceComponent({100.0, 0.0}));
+        const cse::ComponentId inverter = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("io.output");
+        assert(editor.PlaceComponent({200.0, 0.0}));
+        const cse::ComponentId inner_output = editor.GetSelection().component_ids.front();
+
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({inner_input, 1}, {50.0, 15.0}));
+        assert(editor.CompleteWire({inverter, 1}, {100.0, 25.0}));
+        assert(editor.BeginWire({inverter, 2}, {170.0, 25.0}));
+        assert(editor.CompleteWire({inner_output, 1}, {200.0, 15.0}));
+
+        editor.SelectComponent(inner_input);
+        editor.ToggleComponentSelection(inverter);
+        editor.ToggleComponentSelection(inner_output);
+        const cse::Result<cse::ComponentId> created =
+            editor.CreateComposite("custom.inverter", "Inverter");
+        assert(created.ok);
+        assert(editor.GetSnapshot().components.size() == 1);
+        assert(library.FindComposite("custom.inverter") != nullptr);
+
+        cse::SchematicSnapshot external;
+        external.components = {
+            MakeComponent(10, "io.input", "IN1", 0.0, 0.0),
+            MakeComponent(11, "custom.inverter", "U1", 100.0, 0.0),
+            MakeComponent(12, "io.output", "OUT1", 250.0, 0.0),
+        };
+        external.wires = {
+            MakeWire(20, 10, 1, {50.0, 15.0}, 11, 1, {100.0, 15.0}),
+            MakeWire(21, 11, 2, {200.0, 15.0}, 12, 1, {250.0, 15.0}),
+        };
+        const cse::sim::SimulationResult inverted =
+            cse::sim::RunSimulation(external, library, {{10, cse::LogicValue::kHigh}});
+        assert(inverted.pin_values.at(cse::PinKey(12, 1)) == cse::LogicValue::kLow);
+
+        const std::string path = "cse_test_composite.cseproj";
+        assert(cse::io::SaveProject(editor.GetSnapshot(), path).ok);
+        const cse::Result<cse::SchematicSnapshot> loaded = cse::io::LoadProject(path);
+        assert(loaded.ok);
+        assert(loaded.value.composite_modules.size() == 1);
+        assert(loaded.value.composite_modules.front()->implementation.components.size() == 3);
+        cse::model::SchematicModel reopened_model;
+        cse::component::ComponentLibrary reopened_library;
+        cse::component::ComponentFactory reopened_factory(reopened_library);
+        cse::editor::EditorController reopened_editor(reopened_model, reopened_library,
+                                                       reopened_factory);
+        reopened_editor.LoadSnapshot(loaded.value);
+        assert(reopened_library.FindComposite("custom.inverter") != nullptr);
+        const cse::sim::SimulationResult reopened_inverted =
+            cse::sim::RunSimulation(external, reopened_library,
+                                    {{10, cse::LogicValue::kHigh}});
+        assert(reopened_inverted.pin_values.at(cse::PinKey(12, 1)) ==
+               cse::LogicValue::kLow);
+        std::filesystem::remove(path);
+    }
+
     // ---- 测试用小工具：按 id/类型/位号/坐标造元件和导线 ----
 
     cse::ComponentInstance MakeComponent(cse::ComponentId id, const std::string& type_id,
@@ -776,6 +849,7 @@ int main() {
     TestEditorCommandsAndWireWorkflow();
     TestProjectSaveFormat();          // ← 加这一行
     TestProjectPropertyEscapingAndValidation();
+    TestCompositeComponentSimulationAndPersistence();
     TestProjectSaveLoadRoundtrip();
     TestBuildNetsPinsAndTJunction();
     TestBuildNetsSharedPin();
