@@ -198,6 +198,33 @@ Point2D ResolveWireEndpoint(const SchematicSnapshot& snapshot, const IComponentL
     return PinPosition(*component_iterator, *definition, *pin_iterator);
 }
 
+Point2D PinAbsolutePosition(const ComponentInstance& component,
+                            const ComponentDefinition& definition, const PinDefinition& pin) {
+    return PinPosition(component, definition, pin);
+}
+
+Rect2D RotatedComponentBounds(const ComponentDefinition& definition, double rotation_deg) {
+    const Rect2D& bounds = definition.default_bounds;
+    const Point2D corners[4] = {
+        RotateRelative({0.0, 0.0}, bounds, rotation_deg),
+        RotateRelative({bounds.width, 0.0}, bounds, rotation_deg),
+        RotateRelative({bounds.width, bounds.height}, bounds, rotation_deg),
+        RotateRelative({0.0, bounds.height}, bounds, rotation_deg),
+    };
+
+    double min_x = corners[0].x;
+    double max_x = corners[0].x;
+    double min_y = corners[0].y;
+    double max_y = corners[0].y;
+    for (const Point2D& corner : corners) {
+        min_x = std::min(min_x, corner.x);
+        max_x = std::max(max_x, corner.x);
+        min_y = std::min(min_y, corner.y);
+        max_y = std::max(max_y, corner.y);
+    }
+    return {min_x, min_y, max_x - min_x, max_y - min_y};
+}
+
 std::vector<Point2D> PlanWireRoute(const SchematicSnapshot& snapshot,
                                    const IComponentLibrary& library, Point2D from, Point2D to,
                                    const std::optional<PinRef>& from_pin,

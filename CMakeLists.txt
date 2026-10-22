@@ -23,6 +23,7 @@ set(CSE_CORE_SOURCES
     src/editor/editor_commands.cpp
     src/editor/editor_controller.cpp
     src/io/kicad_netlist_exporter.cpp
+    src/io/kicad_schematic_exporter.cpp
     src/io/project_serializer.cpp
     src/model/net_builder.cpp
     src/model/schematic_model.cpp
