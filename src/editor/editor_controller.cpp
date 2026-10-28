@@ -9,11 +9,15 @@
 
 #include "src/editor/editor_commands.hpp"
 
+#include "src/model/wire_route.hpp"
+
 namespace cse::editor {
 
 namespace {
 
 constexpr double kPointEpsilon = 0.000001;
+// 与建网/布线一致的连接容差：两点距离小于它视为同一连接点。
+constexpr double kJoinEpsilon = 0.5;
 
 bool SamePoint(Point2D first, Point2D second) {
     return std::abs(first.x - second.x) < kPointEpsilon &&
@@ -24,6 +28,56 @@ bool SamePoint(Point2D first, Point2D second) {
 Point2D WireAnchor(const PendingWire& pending_wire) {
     return pending_wire.route_points.empty() ? pending_wire.start_position
                                              : pending_wire.route_points.back();
+}
+
+// 导线端点的"连接身份"：挂引脚看 (元件, 引脚)，自由端点看坐标。
+// 用来拒绝重复导线——同一条连接画两次会得到两条完全重叠的线。
+struct EndpointKey {
+    bool has_pin{false};
+    ComponentId component_id{kInvalidComponentId};
+    PinId pin_id{0};
+    Point2D position;
+};
+
+EndpointKey KeyFor(const WireEndpoint& endpoint, const SchematicSnapshot& snapshot,
+                   const IComponentLibrary& library) {
+    EndpointKey key;
+    key.position = model::ResolveWireEndpoint(snapshot, library, endpoint);
+    if (endpoint.pin.has_value()) {
+        key.has_pin = true;
+        key.component_id = endpoint.pin->component_id;
+        key.pin_id = endpoint.pin->pin_id;
+    }
+    return key;
+}
+
+bool SameEndpointKey(const EndpointKey& first, const EndpointKey& second) {
+    if (first.has_pin && second.has_pin) {
+        return first.component_id == second.component_id && first.pin_id == second.pin_id;
+    }
+    if (first.has_pin != second.has_pin) {
+        return false;
+    }
+    return std::abs(first.position.x - second.position.x) < kJoinEpsilon &&
+           std::abs(first.position.y - second.position.y) < kJoinEpsilon;
+}
+
+// 这条新导线是否与既有导线连接完全相同（端点不分先后）。
+bool DuplicateWireExists(const WireModel& wire, const SchematicSnapshot& snapshot,
+                         const IComponentLibrary& library) {
+    const EndpointKey from_key = KeyFor(wire.from, snapshot, library);
+    const EndpointKey to_key = KeyFor(wire.to, snapshot, library);
+    for (const WireModel& existing : snapshot.wires) {
+        const EndpointKey existing_from = KeyFor(existing.from, snapshot, library);
+        const EndpointKey existing_to = KeyFor(existing.to, snapshot, library);
+        if ((SameEndpointKey(from_key, existing_from) &&
+             SameEndpointKey(to_key, existing_to)) ||
+            (SameEndpointKey(from_key, existing_to) &&
+             SameEndpointKey(to_key, existing_from))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -267,7 +321,46 @@ void EditorController::SelectWire(std::optional<WireId> wire_id) {
         next_selection.wire_ids.push_back(*wire_id);
     }
     if (next_selection.component_ids == selection_.component_ids &&
-        next_selection.wire_ids == selection_.wire_ids) {
+        next_selection.wire_ids == selection_.wire_ids &&
+        next_selection.text_label_ids == selection_.text_label_ids) {
+        return;
+    }
+    selection_ = std::move(next_selection);
+    NotifySelectionChanged();
+}
+
+void EditorController::SelectTextLabel(std::optional<TextLabelId> label_id) {
+    SelectionState next_selection;
+    if (label_id.has_value() && model_.ContainsTextLabel(*label_id)) {
+        next_selection.text_label_ids.push_back(*label_id);
+    }
+    if (next_selection.component_ids == selection_.component_ids &&
+        next_selection.wire_ids == selection_.wire_ids &&
+        next_selection.text_label_ids == selection_.text_label_ids) {
+        return;
+    }
+    selection_ = std::move(next_selection);
+    NotifySelectionChanged();
+}
+
+void EditorController::SelectAll() {
+    const SchematicSnapshot snapshot = model_.GetSnapshot();
+    SelectionState next_selection;
+    next_selection.component_ids.reserve(snapshot.components.size());
+    for (const ComponentInstance& component : snapshot.components) {
+        next_selection.component_ids.push_back(component.id);
+    }
+    next_selection.wire_ids.reserve(snapshot.wires.size());
+    for (const WireModel& wire : snapshot.wires) {
+        next_selection.wire_ids.push_back(wire.id);
+    }
+    next_selection.text_label_ids.reserve(snapshot.text_labels.size());
+    for (const TextLabel& label : snapshot.text_labels) {
+        next_selection.text_label_ids.push_back(label.id);
+    }
+    if (next_selection.component_ids == selection_.component_ids &&
+        next_selection.wire_ids == selection_.wire_ids &&
+        next_selection.text_label_ids == selection_.text_label_ids) {
         return;
     }
     selection_ = std::move(next_selection);
@@ -275,74 +368,160 @@ void EditorController::SelectWire(std::optional<WireId> wire_id) {
 }
 
 bool EditorController::MoveComponent(ComponentId component_id, Point2D position) {
-    const std::optional<ComponentInstance> component = model_.GetComponent(component_id);
-    if (!component.has_value()) {
+    return MoveComponents({component_id}, {position}, false);
+}
+
+bool EditorController::MoveComponents(const std::vector<ComponentId>& component_ids,
+                                      const std::vector<Point2D>& positions,
+                                      bool coalesce_with_previous) {
+    if (component_ids.empty() || component_ids.size() != positions.size()) {
         return false;
     }
 
-    const Point2D new_position = SnapToGrid(position);
-    if (component->position.x == new_position.x && component->position.y == new_position.y) {
+    std::vector<MoveSelectionCommand::ComponentMove> moves;
+    std::vector<ComponentId> moved_ids;
+    std::vector<Point2D> moved_positions;
+    for (std::size_t index = 0; index < component_ids.size(); ++index) {
+        const std::optional<ComponentInstance> component =
+            model_.GetComponent(component_ids[index]);
+        if (!component.has_value()) {
+            continue;
+        }
+        const Point2D new_position = SnapToGrid(positions[index]);
+        if (component->position.x == new_position.x && component->position.y == new_position.y) {
+            continue;
+        }
+        moves.push_back({component_ids[index], component->position, new_position});
+        moved_ids.push_back(component_ids[index]);
+        moved_positions.push_back(new_position);
+    }
+    if (moves.empty()) {
         return false;
     }
 
-    return ExecuteCommand(std::make_unique<MoveComponentCommand>(
-        NextCommandId(), model_, component_id, component->position, new_position));
+    std::vector<MoveSelectionCommand::WireRouteChange> wire_changes;
+    const std::vector<WireRouteChange> planned = PlanWireReroutes(moved_ids, moved_positions);
+    wire_changes.reserve(planned.size());
+    for (const WireRouteChange& change : planned) {
+        wire_changes.push_back({change.wire_id, change.old_route_points,
+                                change.new_route_points});
+    }
+
+    // 方向键连续微调：并进上一条"微调专用"的 MoveSelection，撤销一次回起点，
+    // 不然每按一下方向键就多一条撤销记录，撤销像"没反应"。
+    // 拖动提交的命令 coalescable=false，不会被微调并进去。
+    if (coalesce_with_previous && !undo_stack_.empty()) {
+        auto* previous = dynamic_cast<MoveSelectionCommand*>(undo_stack_.back().get());
+        if (previous != nullptr && previous->Coalescable() &&
+            previous->CoversComponents(moved_ids)) {
+            previous->UpdateTargets(moved_positions, wire_changes);
+            NotifyModelChanged();
+            return true;
+        }
+    }
+
+    return ExecuteCommand(std::make_unique<MoveSelectionCommand>(
+        NextCommandId(), model_, std::move(moves), std::move(wire_changes),
+        coalesce_with_previous));
+}
+
+std::vector<EditorController::WireRouteChange> EditorController::PlanWireReroutes(
+    const std::vector<ComponentId>& moved_ids, const std::vector<Point2D>& new_positions) const {
+    SchematicSnapshot probe = model_.GetSnapshot();
+    for (std::size_t index = 0; index < moved_ids.size(); ++index) {
+        for (ComponentInstance& component : probe.components) {
+            if (component.id == moved_ids[index]) {
+                component.position = new_positions[index];
+                break;
+            }
+        }
+    }
+    const std::unordered_set<ComponentId> moved(moved_ids.begin(), moved_ids.end());
+
+    std::vector<WireRouteChange> changes;
+    for (const WireModel& wire : probe.wires) {
+        const bool from_moved =
+            wire.from.pin.has_value() && moved.count(wire.from.pin->component_id) != 0;
+        const bool to_moved =
+            wire.to.pin.has_value() && moved.count(wire.to.pin->component_id) != 0;
+        if (!from_moved && !to_moved) {
+            continue;
+        }
+        WireRouteChange change;
+        change.wire_id = wire.id;
+        change.old_route_points = wire.route_points;
+        change.new_route_points = model::PlanWireRoute(
+            probe, library_, model::ResolveWireEndpoint(probe, library_, wire.from),
+            model::ResolveWireEndpoint(probe, library_, wire.to), wire.from.pin, wire.to.pin);
+        changes.push_back(std::move(change));
+    }
+    return changes;
 }
 
 bool EditorController::RotateSelected() {
-    if (selection_.component_ids.size() != 1) {
+    if (selection_.component_ids.empty()) {
         return false;
     }
 
-    const ComponentId component_id = selection_.component_ids.front();
-    const std::optional<ComponentInstance> component = model_.GetComponent(component_id);
-    if (!component.has_value()) {
-        return false;
-    }
-
-    double new_rotation = std::fmod(component->rotation_deg + 90.0, 360.0);
-    if (new_rotation < 0.0) {
-        new_rotation += 360.0;
-    }
-    return ExecuteCommand(std::make_unique<RotateComponentCommand>(
-        NextCommandId(), model_, component_id, component->rotation_deg, new_rotation));
-}
-
-bool EditorController::DeleteSelection() {
-    if (selection_.component_ids.empty() && selection_.wire_ids.empty()) {
-        return false;
-    }
-
-    std::vector<ComponentInstance> components;
-    std::vector<WireModel> wires;
-    std::unordered_set<WireId> wire_ids;
+    std::vector<RotateSelectionCommand::ComponentRotate> rotations;
     for (ComponentId component_id : selection_.component_ids) {
         const std::optional<ComponentInstance> component = model_.GetComponent(component_id);
         if (!component.has_value()) {
             continue;
         }
-        components.push_back(*component);
-        for (const WireModel& wire : model_.GetWiresForComponent(component_id)) {
-            if (wire_ids.insert(wire.id).second) {
-                wires.push_back(wire);
-            }
+        double new_rotation = std::fmod(component->rotation_deg + 90.0, 360.0);
+        if (new_rotation < 0.0) {
+            new_rotation += 360.0;
+        }
+        rotations.push_back({component_id, component->rotation_deg, new_rotation});
+    }
+    if (rotations.empty()) {
+        return false;
+    }
+    return ExecuteCommand(std::make_unique<RotateSelectionCommand>(
+        NextCommandId(), model_, std::move(rotations)));
+}
+
+bool EditorController::DeleteSelection() {
+    if (selection_.component_ids.empty() && selection_.wire_ids.empty() &&
+        selection_.text_label_ids.empty()) {
+        return false;
+    }
+
+    std::vector<ComponentInstance> components;
+    std::vector<WireModel> wires;
+    std::vector<TextLabel> text_labels;
+    for (ComponentId component_id : selection_.component_ids) {
+        const std::optional<ComponentInstance> component = model_.GetComponent(component_id);
+        if (component.has_value()) {
+            components.push_back(*component);
         }
     }
+    // 只删显式选中的导线：删元件不再连带删线，半张图的线不会跟着消失；
+    // 挂空的导线端点退化为自由坐标，仍可单独选中删除或重新接线。
+    std::unordered_set<WireId> wire_ids;
     for (WireId wire_id : selection_.wire_ids) {
         const std::optional<WireModel> wire = model_.GetWire(wire_id);
         if (wire.has_value() && wire_ids.insert(wire_id).second) {
             wires.push_back(*wire);
         }
     }
+    for (TextLabelId label_id : selection_.text_label_ids) {
+        const std::optional<TextLabel> label = model_.GetTextLabel(label_id);
+        if (label.has_value()) {
+            text_labels.push_back(*label);
+        }
+    }
 
     // 选区里可能全是已经不存在的 id（比如撤销后留下的死引用）：
     // 过滤后没东西可删就别把空命令推进撤销栈污染历史。
-    if (components.empty() && wires.empty()) {
+    if (components.empty() && wires.empty() && text_labels.empty()) {
         return false;
     }
 
     if (!ExecuteCommand(std::make_unique<DeleteSelectionCommand>(
-            NextCommandId(), model_, std::move(components), std::move(wires)))) {
+            NextCommandId(), model_, std::move(components), std::move(wires),
+            std::move(text_labels)))) {
         return false;
     }
 
@@ -350,6 +529,49 @@ bool EditorController::DeleteSelection() {
     pending_wire_.reset();
     NotifySelectionChanged();
     return true;
+}
+
+Result<TextLabelId> EditorController::AddTextLabel(Point2D position, std::string text) {
+    // 文本要放进单行记录里保存，换行会破坏工程文件格式，这里先拍平。
+    for (char& character : text) {
+        if (character == '\n' || character == '\r' || character == '\t') {
+            character = ' ';
+        }
+    }
+    while (!text.empty() && text.front() == ' ') {
+        text.erase(text.begin());
+    }
+    while (!text.empty() && text.back() == ' ') {
+        text.pop_back();
+    }
+    if (text.empty()) {
+        return Result<TextLabelId>::Failure(ErrorCode::kInvalidArgument, "文本内容不能为空");
+    }
+
+    TextLabel label;
+    label.position = SnapToGrid(position);
+    label.text = text;
+    auto command = std::make_unique<AddTextLabelCommand>(NextCommandId(), model_, label);
+    AddTextLabelCommand* raw = command.get();
+    if (!ExecuteCommand(std::move(command))) {
+        return Result<TextLabelId>::Failure(ErrorCode::kInvalidArgument,
+                                            "无法添加文本标注");
+    }
+    SelectTextLabel(raw->Label().id);
+    return Result<TextLabelId>::Success(raw->Label().id);
+}
+
+bool EditorController::MoveTextLabel(TextLabelId label_id, Point2D position) {
+    const std::optional<TextLabel> label = model_.GetTextLabel(label_id);
+    if (!label.has_value()) {
+        return false;
+    }
+    const Point2D new_position = SnapToGrid(position);
+    if (label->position.x == new_position.x && label->position.y == new_position.y) {
+        return false;
+    }
+    return ExecuteCommand(std::make_unique<MoveTextLabelCommand>(
+        NextCommandId(), model_, label_id, label->position, new_position));
 }
 
 bool EditorController::BeginWire(PinRef pin, Point2D position) {
@@ -430,6 +652,12 @@ bool EditorController::FinishPendingWire(std::optional<PinRef> end_pin, Point2D 
     wire.to.pin = end_pin;
     wire.to.position = position;
     wire.route_points = std::move(route_points);
+
+    // 完全相同的连接已经存在时拒绝：两条重叠的导线画布上看不出来，
+    // 但选中/删除会一次次"咬"到同一条线。
+    if (DuplicateWireExists(wire, model_.GetSnapshot(), library_)) {
+        return false;
+    }
 
     const bool executed = ExecuteCommand(
         std::make_unique<AddWireCommand>(NextCommandId(), model_, std::move(wire)));

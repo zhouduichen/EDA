@@ -42,10 +42,18 @@ public:
     void SelectComponent(std::optional<ComponentId> component_id);
     void ToggleComponentSelection(ComponentId component_id);
     void SelectWire(std::optional<WireId> wire_id);
+    void SelectTextLabel(std::optional<TextLabelId> label_id);
+    void SelectAll();
     Result<ComponentId> CreateComposite(std::string type_id, std::string display_name);
     bool MoveComponent(ComponentId component_id, Point2D position);
+    // 多选整体移动：coalesce 为 true 时与上一条 MoveSelection 合并成一条命令
+    //（方向键连续微调撤销一次就回起点）。
+    bool MoveComponents(const std::vector<ComponentId>& component_ids,
+                        const std::vector<Point2D>& positions, bool coalesce_with_previous);
     bool RotateSelected();
     bool DeleteSelection();
+    Result<TextLabelId> AddTextLabel(Point2D position, std::string text);
+    bool MoveTextLabel(TextLabelId label_id, Point2D position);
 
     bool BeginWire(PinRef pin, Point2D position);
     bool CompleteWire(PinRef pin, Point2D position);
@@ -75,8 +83,19 @@ public:
     void SetSelectionChangedHandler(SelectionChangedHandler handler);
 
 private:
+    struct WireRouteChange {
+        WireId wire_id{kInvalidWireId};
+        std::vector<Point2D> old_route_points;
+        std::vector<Point2D> new_route_points;
+    };
+
     bool IsValidPin(PinRef pin) const;
     bool FinishPendingWire(std::optional<PinRef> end_pin, Point2D position);
+    // 元件挪到新位置后，挂在它们引脚上的导线按新几何重算拐点，
+    // 否则导线还按旧位置存的拐点逐段补直角，挪一下就拐出锯齿。
+    std::vector<WireRouteChange> PlanWireReroutes(
+        const std::vector<ComponentId>& moved_ids,
+        const std::vector<Point2D>& new_positions) const;
     bool ExecuteCommand(std::unique_ptr<ICommand> command);
     void NotifyModelChanged();
     void NotifySelectionChanged();

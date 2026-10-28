@@ -41,6 +41,16 @@ bool SchematicModel::AddComponent(ComponentInstance component) {
     return true;
 }
 
+bool SchematicModel::RemoveComponent(ComponentId component_id) {
+    const auto component_iterator = components_.find(component_id);
+    if (component_iterator == components_.end()) {
+        return false;
+    }
+    components_.erase(component_iterator);
+    BumpRevision();
+    return true;
+}
+
 bool SchematicModel::RemoveComponentAndWires(ComponentId component_id,
                                               ComponentRemoval* removal) {
     const auto component_iterator = components_.find(component_id);
@@ -93,8 +103,10 @@ bool SchematicModel::RestoreComponent(const ComponentRemoval& removal) {
 void SchematicModel::Clear() {
     components_.clear();
     wires_.clear();
+    text_labels_.clear();
     next_component_id_ = 1;
     next_wire_id_ = 1;
+    next_text_label_id_ = 1;
     BumpRevision();
 }
 
@@ -156,6 +168,71 @@ bool SchematicModel::RemoveWire(WireId wire_id, WireModel* removed_wire) {
     return true;
 }
 
+bool SchematicModel::SetWireRoutePoints(WireId wire_id, std::vector<Point2D> route_points) {
+    const auto iterator = wires_.find(wire_id);
+    if (iterator == wires_.end()) {
+        return false;
+    }
+    iterator->second.route_points = std::move(route_points);
+    BumpRevision();
+    return true;
+}
+
+bool SchematicModel::AddTextLabel(TextLabel& label) {
+    if (label.text.empty() || !std::isfinite(label.position.x) ||
+        !std::isfinite(label.position.y)) {
+        return false;
+    }
+    if (label.id == kInvalidTextLabelId) {
+        label.id = next_text_label_id_;
+    }
+    if (text_labels_.count(label.id) != 0) {
+        return false;
+    }
+    UpdateNextTextLabelId(label.id);
+    text_labels_.emplace(label.id, label);
+    BumpRevision();
+    return true;
+}
+
+bool SchematicModel::RemoveTextLabel(TextLabelId label_id, TextLabel* removed_label) {
+    const auto iterator = text_labels_.find(label_id);
+    if (iterator == text_labels_.end()) {
+        return false;
+    }
+    if (removed_label != nullptr) {
+        *removed_label = iterator->second;
+    }
+    text_labels_.erase(iterator);
+    BumpRevision();
+    return true;
+}
+
+bool SchematicModel::SetTextLabelPosition(TextLabelId label_id, Point2D position) {
+    const auto iterator = text_labels_.find(label_id);
+    if (iterator == text_labels_.end()) {
+        return false;
+    }
+    if (iterator->second.position.x == position.x && iterator->second.position.y == position.y) {
+        return true;
+    }
+    iterator->second.position = position;
+    BumpRevision();
+    return true;
+}
+
+bool SchematicModel::ContainsTextLabel(TextLabelId label_id) const {
+    return text_labels_.count(label_id) != 0;
+}
+
+std::optional<TextLabel> SchematicModel::GetTextLabel(TextLabelId label_id) const {
+    const auto iterator = text_labels_.find(label_id);
+    if (iterator == text_labels_.end()) {
+        return std::nullopt;
+    }
+    return iterator->second;
+}
+
 bool SchematicModel::ContainsComponent(ComponentId component_id) const {
     return components_.count(component_id) != 0;
 }
@@ -208,6 +285,10 @@ SchematicSnapshot SchematicModel::GetSnapshot() const {
         static_cast<void>(wire_id);
         snapshot.wires.push_back(wire);
     }
+    for (const auto& [label_id, label] : text_labels_) {
+        static_cast<void>(label_id);
+        snapshot.text_labels.push_back(label);
+    }
 
     std::sort(snapshot.components.begin(), snapshot.components.end(),
               [](const ComponentInstance& first, const ComponentInstance& second) {
@@ -215,6 +296,10 @@ SchematicSnapshot SchematicModel::GetSnapshot() const {
               });
     std::sort(snapshot.wires.begin(), snapshot.wires.end(),
               [](const WireModel& first, const WireModel& second) {
+                  return first.id < second.id;
+              });
+    std::sort(snapshot.text_labels.begin(), snapshot.text_labels.end(),
+              [](const TextLabel& first, const TextLabel& second) {
                   return first.id < second.id;
               });
     return snapshot;
@@ -237,6 +322,12 @@ void SchematicModel::UpdateNextComponentId(ComponentId component_id) {
 void SchematicModel::UpdateNextWireId(WireId wire_id) {
     if (wire_id >= next_wire_id_) {
         next_wire_id_ = wire_id + 1;
+    }
+}
+
+void SchematicModel::UpdateNextTextLabelId(TextLabelId label_id) {
+    if (label_id >= next_text_label_id_) {
+        next_text_label_id_ = label_id + 1;
     }
 }
 

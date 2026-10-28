@@ -15,15 +15,15 @@ namespace cse::io {
     namespace {
 
         constexpr const char* kMagic = "CSEPROJ";
-        // v2 增加导线拐点，v3 增加自定义组合元件定义。
-        constexpr int kFormatVersion = 3;
+        // v2 增加导线拐点，v3 增加自定义组合元件定义，v4 增加文本标注。
+        constexpr int kFormatVersion = 4;
         constexpr int kMinSupportedVersion = 1;
         // 畸形文件里 ROUTE 数量可能是任意大数，先拦一道，避免按声明开数组。
         constexpr std::size_t kMaxRoutePoints = 10000;
 
         int VersionFor(const SchematicSnapshot& snapshot) {
-            if (!snapshot.composite_modules.empty()) {
-                return 3;
+            if (!snapshot.composite_modules.empty() || !snapshot.text_labels.empty()) {
+                return 4;
             }
             for (const WireModel& wire : snapshot.wires) {
                 if (!wire.route_points.empty()) {
@@ -207,6 +207,15 @@ namespace cse::io {
                     }
                 }
             }
+            std::unordered_set<TextLabelId> text_label_ids;
+            for (const TextLabel& label : snapshot.text_labels) {
+                if (label.id == kInvalidTextLabelId || !text_label_ids.insert(label.id).second ||
+                    label.text.empty() || !std::isfinite(label.position.x) ||
+                    !std::isfinite(label.position.y)) {
+                    return Result<void>::Failure(ErrorCode::kInvalidFileFormat,
+                                                 "invalid or duplicate text label");
+                }
+            }
             std::unordered_set<std::string> module_ids;
             for (const auto& module : snapshot.composite_modules) {
                 if (module == nullptr || module->definition.type_id.empty() ||
@@ -354,6 +363,12 @@ namespace cse::io {
             write_wire(wire);
         }
 
+        // 文本内容走 std::quoted：空格/引号都安全；换行已在录入时拍平成空格。
+        for (const TextLabel& label : snapshot.text_labels) {
+            stream << "TEXT " << label.id << ' ' << FormatDouble(label.position.x) << ' '
+                   << FormatDouble(label.position.y) << ' ' << std::quoted(label.text) << '\n';
+        }
+
         stream << "END\n";
 
         if (!stream.good()) {
@@ -494,6 +509,25 @@ namespace cse::io {
                 } else {
                     snapshot.components.push_back(std::move(component));
                 }
+            }
+            else if (tag == "TEXT") {
+                TextLabel label;
+                if (current_module != nullptr ||
+                    !(row >> label.id >> label.position.x >> label.position.y) ||
+                    label.id == kInvalidTextLabelId) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "bad TEXT record at line " + std::to_string(line_number));
+                }
+                if (!(row >> std::quoted(label.text)) || label.text.empty()) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "bad TEXT content at line " + std::to_string(line_number));
+                }
+                std::string extra;
+                if (row >> extra) {
+                    return Result<SchematicSnapshot>::Failure(ErrorCode::kInvalidFileFormat,
+                        "extra TEXT field at line " + std::to_string(line_number));
+                }
+                snapshot.text_labels.push_back(std::move(label));
             }
             else if (tag == "WIRE") {
                 WireModel wire;

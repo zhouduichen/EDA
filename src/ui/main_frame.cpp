@@ -63,12 +63,14 @@ void MainFrame::BuildMenuBar() {
     menu_edit->Append(kMenuRedo, L"重做\tCtrl+Y");
     menu_edit->AppendSeparator();
     menu_edit->Append(kMenuDelete, L"删除\tDelete");
+    menu_edit->Append(kMenuSelectAll, L"全选\tCtrl+A");
     menu_edit->Append(kMenuCreateComposite, L"将选区创建为自定义元件...");
 
     auto* menu_tool = new wxMenu();
     menu_tool->AppendRadioItem(kMenuSelectTool, L"选择\tS");
     menu_tool->AppendRadioItem(kMenuWireTool, L"连线\tW");
     menu_tool->AppendRadioItem(kMenuPanTool, L"平移\tP");
+    menu_tool->AppendRadioItem(kMenuTextTool, L"文本\tT");
     menu_tool->AppendSeparator();
     menu_tool->Append(kMenuRotate, L"旋转\tR");
 
@@ -98,10 +100,12 @@ void MainFrame::BuildMenuBar() {
     Bind(wxEVT_MENU, &MainFrame::OnUndo, this, kMenuUndo);
     Bind(wxEVT_MENU, &MainFrame::OnRedo, this, kMenuRedo);
     Bind(wxEVT_MENU, &MainFrame::OnDelete, this, kMenuDelete);
+    Bind(wxEVT_MENU, &MainFrame::OnSelectAll, this, kMenuSelectAll);
     Bind(wxEVT_MENU, &MainFrame::OnCreateComposite, this, kMenuCreateComposite);
     Bind(wxEVT_MENU, &MainFrame::OnSelectTool, this, kMenuSelectTool);
     Bind(wxEVT_MENU, &MainFrame::OnWireTool, this, kMenuWireTool);
     Bind(wxEVT_MENU, &MainFrame::OnPanTool, this, kMenuPanTool);
+    Bind(wxEVT_MENU, &MainFrame::OnTextTool, this, kMenuTextTool);
     Bind(wxEVT_MENU, &MainFrame::OnRotate, this, kMenuRotate);
     Bind(wxEVT_MENU, &MainFrame::OnZoomIn, this, kMenuZoomIn);
     Bind(wxEVT_MENU, &MainFrame::OnZoomOut, this, kMenuZoomOut);
@@ -288,6 +292,13 @@ void MainFrame::OnPanTool(wxCommandEvent& event) {
     UpdateStatus();
 }
 
+void MainFrame::OnTextTool(wxCommandEvent& event) {
+    static_cast<void>(event);
+    editor_.SetToolMode(ToolMode::kText);
+    UpdateStatus();
+    panel_canvas_->SetFocus();
+}
+
 void MainFrame::OnRotate(wxCommandEvent& event) {
     static_cast<void>(event);
     static_cast<void>(editor_.RotateSelected());
@@ -298,6 +309,13 @@ void MainFrame::OnDelete(wxCommandEvent& event) {
     static_cast<void>(event);
     static_cast<void>(editor_.DeleteSelection());
     RefreshViews();
+}
+
+void MainFrame::OnSelectAll(wxCommandEvent& event) {
+    static_cast<void>(event);
+    editor_.SelectAll();
+    RefreshViews();
+    panel_canvas_->SetFocus();
 }
 
 void MainFrame::OnCreateComposite(wxCommandEvent& event) {
@@ -396,6 +414,9 @@ void MainFrame::UpdateStatus() {
             break;
         case ToolMode::kPan:
             tool_name = L"平移";
+            break;
+        case ToolMode::kText:
+            tool_name = L"文本";
             break;
         case ToolMode::kSelect:
             break;

@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_set>
 
 #include <wx/cursor.h>
 #include <wx/dcbuffer.h>
 #include <wx/dc.h>
 #include <wx/settings.h>
+#include <wx/textdlg.h>
 
 #include "src/model/wire_route.hpp"
 
@@ -174,6 +176,7 @@ void SchematicCanvas::OnPaint(wxPaintEvent& event) {
     ApplyDragPreview(snapshot);
     DrawWires(dc, snapshot);
     DrawComponents(dc, snapshot);
+    DrawTextLabels(dc, snapshot);
     DrawDragOriginMarker(dc, snapshot);
     DrawTemporaryWire(dc);
 }
@@ -207,6 +210,26 @@ void SchematicCanvas::OnMouseLeftDown(wxMouseEvent& event) {
         return;
     }
 
+    if (tool_mode == ToolMode::kText) {
+        const SchematicSnapshot snapshot = editor_.GetSnapshot();
+        const std::optional<TextLabelId> label_id = HitTextLabel(last_mouse_model_, snapshot);
+        if (label_id.has_value()) {
+            editor_.SelectTextLabel(*label_id);
+            BeginTextLabelDrag(*label_id, last_mouse_model_);
+            CaptureMouse();
+        } else {
+            wxTextEntryDialog dialog(this, L"输入文本内容：", L"添加文本", wxEmptyString);
+            if (dialog.ShowModal() == wxID_OK) {
+                const std::string text = dialog.GetValue().Trim().ToStdString();
+                if (!text.empty() && !editor_.AddTextLabel(last_mouse_model_, text).ok) {
+                    wxBell();
+                }
+            }
+        }
+        RefreshEditorViews();
+        return;
+    }
+
     if (tool_mode == ToolMode::kPan || event.MiddleIsDown()) {
         pan_start_screen_ = event.GetPosition();
         pan_start_offset_ = {offset_x_, offset_y_};
@@ -221,17 +244,29 @@ void SchematicCanvas::OnMouseLeftDown(wxMouseEvent& event) {
             if (event.ShiftDown()) {
                 editor_.ToggleComponentSelection(*component_id);
             } else {
-                editor_.SelectComponent(*component_id);
+                // 元件已在多选里时不要重置选区：直接整组拖；
+                // 否则才收敛成单选（顺带把点在选外元件上的行为变成"换选"）。
+                if (!IsComponentSelected(*component_id)) {
+                    editor_.SelectComponent(*component_id);
+                }
                 BeginComponentDrag(*component_id, last_mouse_model_);
                 CaptureMouse();
             }
         }
     } else {
-        const std::optional<WireId> wire_id = HitWire(last_mouse_model_);
-        if (wire_id.has_value()) {
-            editor_.SelectWire(*wire_id);
+        const SchematicSnapshot snapshot = editor_.GetSnapshot();
+        const std::optional<TextLabelId> label_id = HitTextLabel(last_mouse_model_, snapshot);
+        if (label_id.has_value()) {
+            editor_.SelectTextLabel(*label_id);
+            BeginTextLabelDrag(*label_id, last_mouse_model_);
+            CaptureMouse();
         } else {
-            editor_.SelectComponent(std::nullopt);
+            const std::optional<WireId> wire_id = HitWire(last_mouse_model_);
+            if (wire_id.has_value()) {
+                editor_.SelectWire(*wire_id);
+            } else {
+                editor_.SelectComponent(std::nullopt);
+            }
         }
     }
     RefreshEditorViews();
@@ -241,6 +276,9 @@ void SchematicCanvas::OnMouseLeftUp(wxMouseEvent& event) {
     static_cast<void>(event);
     if (dragging_component_) {
         EndComponentDrag();
+    }
+    if (dragging_label_) {
+        EndTextLabelDrag();
     }
     if (HasCapture()) {
         ReleaseMouse();
@@ -269,11 +307,25 @@ void SchematicCanvas::OnMouseLeftDoubleClick(wxMouseEvent& event) {
 void SchematicCanvas::OnMouseMove(wxMouseEvent& event) {
     last_mouse_model_ = ScreenToModel(event.GetPosition());
     if (dragging_component_ && event.LeftIsDown()) {
-        // 元件跟着鼠标走：把「按下点 → 当前位置」的位移加到原坐标上，再整体吸附网格。
+        // 元件跟着鼠标走：把「按下点 → 当前位置」的位移加到各自原坐标上，再整体吸附网格。
         const Point2D delta{last_mouse_model_.x - drag_press_model_.x,
                             last_mouse_model_.y - drag_press_model_.y};
-        drag_preview_position_ = editor_.SnapToGrid(
-            {drag_origin_position_.x + delta.x, drag_origin_position_.y + delta.y});
+        std::vector<Point2D> previews;
+        previews.reserve(drag_origin_positions_.size());
+        for (const Point2D& origin : drag_origin_positions_) {
+            previews.push_back(editor_.SnapToGrid({origin.x + delta.x, origin.y + delta.y}));
+        }
+        drag_preview_positions_ = std::move(previews);
+        SetCursor(wxCursor(wxCURSOR_SIZING));
+        Refresh();
+        return;
+    }
+    if (dragging_label_ && event.LeftIsDown()) {
+        // 文本标注跟着鼠标走：位移加到原坐标上再吸附网格。
+        const Point2D delta{last_mouse_model_.x - label_drag_press_model_.x,
+                            last_mouse_model_.y - label_drag_press_model_.y};
+        label_drag_preview_position_ = editor_.SnapToGrid(
+            {label_drag_origin_position_.x + delta.x, label_drag_origin_position_.y + delta.y});
         SetCursor(wxCursor(wxCURSOR_SIZING));
         Refresh();
         return;
@@ -316,6 +368,7 @@ void SchematicCanvas::OnMouseRightDown(wxMouseEvent& event) {
     editor_.CancelWire();
     // 右键打断拖动：这次移动不提交，元件留在原处。
     AbortComponentDrag();
+    AbortTextLabelDrag();
     wire_target_ = WireTarget{};
     UpdateHoverCursor(last_mouse_model_);
     RefreshEditorViews();
@@ -326,6 +379,7 @@ void SchematicCanvas::OnMouseRightDown(wxMouseEvent& event) {
 void SchematicCanvas::OnMouseCaptureLost(wxMouseCaptureLostEvent& event) {
     static_cast<void>(event);
     AbortComponentDrag();
+    AbortTextLabelDrag();
     RefreshEditorViews();
 }
 
@@ -350,6 +404,11 @@ void SchematicCanvas::OnKeyDown(wxKeyEvent& event) {
     }
     if (event.ControlDown() && event.GetKeyCode() == 'Y') {
         static_cast<void>(editor_.Redo());
+        RefreshEditorViews();
+        return;
+    }
+    if (event.ControlDown() && event.GetKeyCode() == 'A') {
+        editor_.SelectAll();
         RefreshEditorViews();
         return;
     }
@@ -383,6 +442,9 @@ void SchematicCanvas::OnKeyDown(wxKeyEvent& event) {
         case 'P':
             editor_.SetToolMode(ToolMode::kPan);
             break;
+        case 'T':
+            editor_.SetToolMode(ToolMode::kText);
+            break;
         case 'R':
             static_cast<void>(editor_.RotateSelected());
             break;
@@ -390,29 +452,38 @@ void SchematicCanvas::OnKeyDown(wxKeyEvent& event) {
         case WXK_RIGHT:
         case WXK_UP:
         case WXK_DOWN: {
-            // 方向键微调选中元件：一次一格，导线跟着引脚走。
+            // 方向键微调选中的元件（支持多选）：一次一格，导线跟着引脚走；
+            // 连续微调并进同一条撤销命令，Ctrl+Z 一次退回整段微调。
             const SelectionState selection = editor_.GetSelection();
-            if (selection.component_ids.size() != 1) {
+            if (selection.component_ids.empty()) {
                 event.Skip();
                 return;
             }
-            const std::optional<ComponentInstance> component =
-                editor_.GetComponent(selection.component_ids.front());
-            if (!component.has_value()) {
-                event.Skip();
-                return;
-            }
-            Point2D target = component->position;
+            Point2D delta{0.0, 0.0};
             if (event.GetKeyCode() == WXK_LEFT) {
-                target.x -= kDefaultGridSize;
+                delta.x = -kDefaultGridSize;
             } else if (event.GetKeyCode() == WXK_RIGHT) {
-                target.x += kDefaultGridSize;
+                delta.x = kDefaultGridSize;
             } else if (event.GetKeyCode() == WXK_UP) {
-                target.y -= kDefaultGridSize;
+                delta.y = -kDefaultGridSize;
             } else {
-                target.y += kDefaultGridSize;
+                delta.y = kDefaultGridSize;
             }
-            if (!editor_.MoveComponent(component->id, target)) {
+            std::vector<ComponentId> ids;
+            std::vector<Point2D> targets;
+            ids.reserve(selection.component_ids.size());
+            targets.reserve(selection.component_ids.size());
+            for (ComponentId component_id : selection.component_ids) {
+                const std::optional<ComponentInstance> component =
+                    editor_.GetComponent(component_id);
+                if (!component.has_value()) {
+                    continue;
+                }
+                ids.push_back(component_id);
+                targets.push_back({component->position.x + delta.x,
+                                   component->position.y + delta.y});
+            }
+            if (ids.empty() || !editor_.MoveComponents(ids, targets, true)) {
                 event.Skip();
                 return;
             }
@@ -467,6 +538,22 @@ Point2D SchematicCanvas::RotateRelative(Point2D relative, Rect2D bounds,
     }
 }
 
+wxPoint SchematicCanvas::RotateScreenPoint(wxPoint point, wxPoint center,
+                                           int quarter_turn) const {
+    const int local_x = point.x - center.x;
+    const int local_y = point.y - center.y;
+    switch (quarter_turn) {
+        case 1:
+            return {center.x - local_y, center.y + local_x};
+        case 2:
+            return {center.x - local_x, center.y - local_y};
+        case 3:
+            return {center.x + local_y, center.y - local_x};
+        default:
+            return point;
+    }
+}
+
 std::optional<ComponentId> SchematicCanvas::HitComponent(Point2D model_point) const {
     return HitComponent(model_point, editor_.GetSnapshot());
 }
@@ -495,6 +582,24 @@ std::optional<ComponentId> SchematicCanvas::HitComponent(
 
 std::optional<SchematicCanvas::PinHit> SchematicCanvas::HitPin(Point2D model_point) const {
     return HitPin(model_point, editor_.GetSnapshot());
+}
+
+// 文本标注命中：以文字的像素尺寸换算成模型矩形（略放宽半格容差）。
+std::optional<TextLabelId> SchematicCanvas::HitTextLabel(Point2D model_point,
+                                                         const SchematicSnapshot& snapshot) const {
+    for (auto iterator = snapshot.text_labels.rbegin();
+         iterator != snapshot.text_labels.rend(); ++iterator) {
+        const wxSize size = GetTextExtent(wxString::FromUTF8(iterator->text));
+        const double width = static_cast<double>(size.x) / zoom_ + 4.0;
+        const double height = static_cast<double>(size.y) / zoom_ + 4.0;
+        if (model_point.x >= iterator->position.x - 2.0 &&
+            model_point.x <= iterator->position.x + width &&
+            model_point.y >= iterator->position.y - 2.0 &&
+            model_point.y <= iterator->position.y + height) {
+            return iterator->id;
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<SchematicCanvas::PinHit> SchematicCanvas::HitPin(
@@ -595,11 +700,25 @@ bool SchematicCanvas::IsWireSelected(WireId wire_id) const {
            selection.wire_ids.end();
 }
 
-// ---- 元件拖动：拖动过程中只改预览坐标，松手才落一条 MoveComponent 命令 ----
+bool SchematicCanvas::IsTextLabelSelected(TextLabelId label_id) const {
+    const SelectionState selection = editor_.GetSelection();
+    return std::find(selection.text_label_ids.begin(), selection.text_label_ids.end(),
+                     label_id) != selection.text_label_ids.end();
+}
+
+// ---- 元件拖动：拖动过程中只改预览坐标，松手才落一条 MoveSelection 命令 ----
+// Shift 多选后按下其中任何一个，整组一起拖。
 
 bool SchematicCanvas::HasDragPreview() const {
-    return dragging_component_ && drag_preview_position_.has_value() &&
-           !SamePoint(*drag_preview_position_, drag_origin_position_);
+    if (!dragging_component_ || !drag_preview_positions_.has_value()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < drag_origin_positions_.size(); ++index) {
+        if (!SamePoint((*drag_preview_positions_)[index], drag_origin_positions_[index])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void SchematicCanvas::BeginComponentDrag(ComponentId component_id, Point2D press_model) {
@@ -607,42 +726,112 @@ void SchematicCanvas::BeginComponentDrag(ComponentId component_id, Point2D press
     if (!component.has_value()) {
         return;
     }
+    // 按下的元件在多选里就整组拖，否则只拖它自己。
+    drag_component_ids_ = IsComponentSelected(component_id) &&
+                                  !editor_.GetSelection().component_ids.empty()
+                              ? editor_.GetSelection().component_ids
+                              : std::vector<ComponentId>{component_id};
+    drag_origin_positions_.clear();
+    for (ComponentId dragged_id : drag_component_ids_) {
+        const std::optional<ComponentInstance> dragged = editor_.GetComponent(dragged_id);
+        if (!dragged.has_value()) {
+            drag_component_ids_.clear();
+            return;
+        }
+        drag_origin_positions_.push_back(dragged->position);
+    }
     dragging_component_ = true;
-    dragging_component_id_ = component_id;
-    drag_origin_position_ = component->position;
     drag_press_model_ = press_model;
-    drag_preview_position_ = component->position;
+    drag_preview_positions_ = drag_origin_positions_;
 }
 
 void SchematicCanvas::EndComponentDrag() {
     if (HasDragPreview()) {
-        static_cast<void>(editor_.MoveComponent(dragging_component_id_, *drag_preview_position_));
+        static_cast<void>(editor_.MoveComponents(drag_component_ids_,
+                                                 *drag_preview_positions_, false));
     }
     dragging_component_ = false;
-    dragging_component_id_ = kInvalidComponentId;
-    drag_preview_position_.reset();
+    drag_component_ids_.clear();
+    drag_origin_positions_.clear();
+    drag_preview_positions_.reset();
 }
 
 void SchematicCanvas::AbortComponentDrag() {
     // 只有真在拖元件时才放掉捕获：中键平移也持有捕获，右键不该打断它。
     const bool was_dragging = dragging_component_;
     dragging_component_ = false;
-    dragging_component_id_ = kInvalidComponentId;
-    drag_preview_position_.reset();
+    drag_component_ids_.clear();
+    drag_origin_positions_.clear();
+    drag_preview_positions_.reset();
     if (was_dragging && HasCapture()) {
         ReleaseMouse();
     }
 }
 
+void SchematicCanvas::BeginTextLabelDrag(TextLabelId label_id, Point2D press_model) {
+    const SchematicSnapshot snapshot = editor_.GetSnapshot();
+    const auto iterator = std::find_if(
+        snapshot.text_labels.begin(), snapshot.text_labels.end(),
+        [label_id](const TextLabel& label) { return label.id == label_id; });
+    if (iterator == snapshot.text_labels.end()) {
+        return;
+    }
+    dragging_label_ = true;
+    dragging_label_id_ = label_id;
+    label_drag_origin_position_ = iterator->position;
+    label_drag_press_model_ = press_model;
+    label_drag_preview_position_ = iterator->position;
+}
+
+void SchematicCanvas::EndTextLabelDrag() {
+    if (HasTextLabelDragPreview() &&
+        !SamePoint(*label_drag_preview_position_, label_drag_origin_position_)) {
+        static_cast<void>(
+            editor_.MoveTextLabel(dragging_label_id_, *label_drag_preview_position_));
+    }
+    dragging_label_ = false;
+    dragging_label_id_ = kInvalidTextLabelId;
+    label_drag_preview_position_.reset();
+}
+
+void SchematicCanvas::AbortTextLabelDrag() {
+    const bool was_dragging = dragging_label_;
+    dragging_label_ = false;
+    dragging_label_id_ = kInvalidTextLabelId;
+    label_drag_preview_position_.reset();
+    if (was_dragging && HasCapture()) {
+        ReleaseMouse();
+    }
+}
+
+bool SchematicCanvas::HasTextLabelDragPreview() const {
+    return dragging_label_ && label_drag_preview_position_.has_value();
+}
+
 // 拖着元件画的时候，用预览坐标替换模型坐标：挂在它引脚上的导线会一起走。
+// 这些导线的 route_points 是按挪动前的位置存的，不清空的话逐段补直角
+// 会拐出锯齿——预览里清掉，让 WirePolyline 按新几何重新规划。
 void SchematicCanvas::ApplyDragPreview(SchematicSnapshot& snapshot) const {
     if (!HasDragPreview()) {
         return;
     }
-    for (ComponentInstance& component : snapshot.components) {
-        if (component.id == dragging_component_id_) {
-            component.position = *drag_preview_position_;
-            return;
+    std::unordered_set<ComponentId> dragged(drag_component_ids_.begin(),
+                                            drag_component_ids_.end());
+    for (std::size_t index = 0; index < drag_component_ids_.size(); ++index) {
+        for (ComponentInstance& component : snapshot.components) {
+            if (component.id == drag_component_ids_[index]) {
+                component.position = (*drag_preview_positions_)[index];
+                break;
+            }
+        }
+    }
+    for (WireModel& wire : snapshot.wires) {
+        const bool from_dragged =
+            wire.from.pin.has_value() && dragged.count(wire.from.pin->component_id) != 0;
+        const bool to_dragged =
+            wire.to.pin.has_value() && dragged.count(wire.to.pin->component_id) != 0;
+        if (from_dragged || to_dragged) {
+            wire.route_points.clear();
         }
     }
 }
@@ -690,6 +879,7 @@ void SchematicCanvas::UpdateHoverCursor(Point2D model_point) {
     switch (editor_.GetToolMode()) {
         case ToolMode::kWire:
         case ToolMode::kPlaceComponent:
+        case ToolMode::kText:
             SetCursor(wxCursor(wxCURSOR_CROSS));
             return;
         case ToolMode::kPan:
@@ -781,10 +971,50 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
         if (!definition.has_value()) {
             continue;
         }
+        const int quarter = NormalizeQuarterTurn(component.rotation_deg);
         const wxPoint top_left = ModelToScreen(component.position);
         const int width = static_cast<int>(std::lround(definition->default_bounds.width * zoom_));
         const int height = static_cast<int>(std::lround(definition->default_bounds.height * zoom_));
         const bool selected = IsComponentSelected(component.id);
+        // 图形必须跟着元件一起转：形状顶点先按未旋转坐标算好，再绕元件中心转
+        // quarter 圈，与引脚圆点（GetPinPosition）和命中测试用同一套旋转公式。
+        const wxPoint center{top_left.x + width / 2, top_left.y + height / 2};
+        const auto rotate = [this, quarter, center](wxPoint point) {
+            return RotateScreenPoint(point, center, quarter);
+        };
+        const auto rotated_corners = [&rotate, top_left, width, height]() {
+            std::vector<wxPoint> corners;
+            corners.reserve(4);
+            corners.push_back(rotate(top_left));
+            corners.push_back(rotate({top_left.x + width, top_left.y}));
+            corners.push_back(rotate({top_left.x + width, top_left.y + height}));
+            corners.push_back(rotate({top_left.x, top_left.y + height}));
+            return corners;
+        };
+        const auto draw_rotated_polygon = [&dc, &rotate](const std::vector<wxPoint>& points,
+                                                         const wxBrush& brush) {
+            std::vector<wxPoint> rotated;
+            rotated.reserve(points.size());
+            for (wxPoint point : points) {
+                rotated.push_back(rotate(point));
+            }
+            dc.SetBrush(brush);
+            dc.DrawPolygon(static_cast<int>(rotated.size()), rotated.data());
+        };
+
+        // 旋转后的外接框：位号和徽标都钉在框上，转完不跑偏。
+        const std::vector<wxPoint> corners = rotated_corners();
+        int min_x = corners.front().x;
+        int max_x = corners.front().x;
+        int min_y = corners.front().y;
+        int max_y = corners.front().y;
+        for (const wxPoint& corner : corners) {
+            min_x = std::min(min_x, corner.x);
+            max_x = std::max(max_x, corner.x);
+            min_y = std::min(min_y, corner.y);
+            max_y = std::max(max_y, corner.y);
+        }
+
         // 悬停提示：鼠标底下的元件加一圈虚线，点下去抓的就是它。
         const bool hovered = !selected && !dragging_component_ &&
                              hover_component_id_.has_value() &&
@@ -792,38 +1022,44 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
         if (hovered) {
             dc.SetPen(wxPen(wxColour(120, 170, 220), 1, wxPENSTYLE_DOT));
             dc.SetBrush(*wxTRANSPARENT_BRUSH);
-            dc.DrawRectangle(top_left.x - 3, top_left.y - 3, width + 6, height + 6);
+            const wxPoint hover_corners[4] = {
+                rotate({top_left.x - 3, top_left.y - 3}),
+                rotate({top_left.x + width + 3, top_left.y - 3}),
+                rotate({top_left.x + width + 3, top_left.y + height + 3}),
+                rotate({top_left.x - 3, top_left.y + height + 3}),
+            };
+            dc.DrawPolygon(4, hover_corners);
         }
         dc.SetPen(wxPen(selected ? wxColour(210, 75, 60) : wxColour(55, 65, 80),
                         selected ? 3 : 2));
         if (definition->category == "custom") {
-            dc.SetBrush(wxBrush(wxColour(237, 232, 250)));
-            dc.DrawRectangle(top_left.x, top_left.y, width, height);
+            draw_rotated_polygon(corners, wxBrush(wxColour(237, 232, 250)));
         } else if (component.type_id == "io.input") {
-            dc.SetBrush(wxBrush(wxColour(224, 240, 252)));
-            dc.DrawRectangle(top_left.x, top_left.y, width, height);
-            dc.DrawLine(top_left.x + width - 14, top_left.y + height / 2,
-                        top_left.x + width, top_left.y + height / 2);
-            dc.DrawLine(top_left.x + width - 14, top_left.y + height / 2,
-                        top_left.x + width - 22, top_left.y + height / 2 - 6);
-            dc.DrawLine(top_left.x + width - 14, top_left.y + height / 2,
-                        top_left.x + width - 22, top_left.y + height / 2 + 6);
+            draw_rotated_polygon(corners, wxBrush(wxColour(224, 240, 252)));
+            const int middle_y = top_left.y + height / 2;
+            const std::vector<std::pair<wxPoint, wxPoint>> arrow{
+                {{top_left.x + width - 14, middle_y}, {top_left.x + width, middle_y}},
+                {{top_left.x + width - 14, middle_y}, {top_left.x + width - 22, middle_y - 6}},
+                {{top_left.x + width - 14, middle_y}, {top_left.x + width - 22, middle_y + 6}},
+            };
+            for (const auto& [from, to] : arrow) {
+                const wxPoint rotated_from = rotate(from);
+                const wxPoint rotated_to = rotate(to);
+                dc.DrawLine(rotated_from, rotated_to);
+            }
         } else if (component.type_id == "io.output") {
-            dc.SetBrush(wxBrush(wxColour(252, 239, 220)));
-            dc.DrawRectangle(top_left.x, top_left.y, width, height);
+            draw_rotated_polygon(corners, wxBrush(wxColour(252, 239, 220)));
         } else if (component.type_id == "logic.not") {
-            dc.SetBrush(wxBrush(wxColour(235, 238, 244)));
-            const wxPoint triangle[3] = {
+            const std::vector<wxPoint> triangle{
                 {top_left.x, top_left.y},
                 {top_left.x + width, top_left.y + height / 2},
                 {top_left.x, top_left.y + height},
             };
-            dc.DrawPolygon(3, triangle);
+            draw_rotated_polygon(triangle, wxBrush(wxColour(235, 238, 244)));
             dc.SetBrush(wxBrush(wxColour(248, 249, 251)));
-            dc.DrawCircle(top_left.x + width + 5, top_left.y + height / 2, 5);
+            dc.DrawCircle(rotate({top_left.x + width + 5, top_left.y + height / 2}), 5);
         } else if (component.type_id == "logic.and") {
-            dc.SetBrush(wxBrush(wxColour(235, 238, 244)));
-            const wxPoint gate[7] = {
+            const std::vector<wxPoint> gate{
                 {top_left.x, top_left.y},
                 {top_left.x + static_cast<int>(width * 0.45), top_left.y},
                 {top_left.x + static_cast<int>(width * 0.78),
@@ -834,10 +1070,9 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
                 {top_left.x + static_cast<int>(width * 0.45), top_left.y + height},
                 {top_left.x, top_left.y + height},
             };
-            dc.DrawPolygon(7, gate);
+            draw_rotated_polygon(gate, wxBrush(wxColour(235, 238, 244)));
         } else {
-            dc.SetBrush(wxBrush(wxColour(235, 238, 244)));
-            const wxPoint gate[8] = {
+            const std::vector<wxPoint> gate{
                 {top_left.x, top_left.y + static_cast<int>(height * 0.22)},
                 {top_left.x + static_cast<int>(width * 0.42), top_left.y},
                 {top_left.x + static_cast<int>(width * 0.76),
@@ -849,25 +1084,31 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
                 {top_left.x, top_left.y + static_cast<int>(height * 0.78)},
                 {top_left.x + static_cast<int>(width * 0.2), top_left.y + height / 2},
             };
-            dc.DrawPolygon(8, gate);
+            draw_rotated_polygon(gate, wxBrush(wxColour(235, 238, 244)));
             if (component.type_id == "logic.xor") {
                 dc.SetPen(wxPen(selected ? wxColour(210, 75, 60) : wxColour(55, 65, 80),
                                 selected ? 3 : 2));
-                const wxPoint extra_curve[3] = {
+                const std::vector<wxPoint> extra_curve{
                     {top_left.x + static_cast<int>(width * 0.04),
                      top_left.y + static_cast<int>(height * 0.18)},
-                    {top_left.x + static_cast<int>(width * 0.22),
-                     top_left.y + height / 2},
+                    {top_left.x + static_cast<int>(width * 0.22), top_left.y + height / 2},
                     {top_left.x + static_cast<int>(width * 0.04),
                      top_left.y + static_cast<int>(height * 0.82)},
                 };
-                dc.DrawLines(3, extra_curve);
+                std::vector<wxPoint> rotated_curve;
+                rotated_curve.reserve(extra_curve.size());
+                for (wxPoint point : extra_curve) {
+                    rotated_curve.push_back(rotate(point));
+                }
+                dc.DrawLines(static_cast<int>(rotated_curve.size()), rotated_curve.data());
             }
         }
 
+        // 名字画在旋转后外接框的中心，位号挂在框下方；文字本身不跟着转，保持可读。
         const wxSize label_size = dc.GetTextExtent(definition->display_name);
-        dc.DrawText(definition->display_name, top_left.x + (width - label_size.x) / 2,
-                    top_left.y + (height - label_size.y) / 2);
+        dc.DrawText(definition->display_name,
+                    (min_x + max_x) / 2 - label_size.x / 2,
+                    (min_y + max_y) / 2 - label_size.y / 2);
 
         for (const PinDefinition& pin : definition->pins) {
             const Point2D pin_position = GetPinPosition(component, *definition, pin);
@@ -890,9 +1131,7 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
                 }
             }
             if (value.has_value()) {
-                const wxPoint badge_center = ModelToScreen(
-                    {component.position.x + definition->default_bounds.width / 2.0,
-                     component.position.y - 10.0});
+                const wxPoint badge_center((min_x + max_x) / 2, min_y - 10);
                 const int radius =
                     std::max(6, static_cast<int>(std::lround(7.0 * zoom_)));
                 dc.SetPen(wxPen(*wxBLACK, 1));
@@ -908,7 +1147,22 @@ void SchematicCanvas::DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot
         }
 
         dc.SetTextForeground(wxColour(80, 85, 95));
-        dc.DrawText(component.reference, top_left.x, top_left.y + height + 3);
+        dc.DrawText(component.reference, min_x, max_y + 3);
+        dc.SetTextForeground(*wxBLACK);
+    }
+}
+
+// 文本标注：选中描红，拖动时画在预览位置。
+void SchematicCanvas::DrawTextLabels(wxDC& dc, const SchematicSnapshot& snapshot) {
+    for (const TextLabel& label : snapshot.text_labels) {
+        Point2D position = label.position;
+        if (dragging_label_ && dragging_label_id_ == label.id &&
+            label_drag_preview_position_.has_value()) {
+            position = *label_drag_preview_position_;
+        }
+        dc.SetTextForeground(IsTextLabelSelected(label.id) ? wxColour(210, 75, 60)
+                                                           : wxColour(40, 45, 55));
+        dc.DrawText(wxString::FromUTF8(label.text), ModelToScreen(position));
         dc.SetTextForeground(*wxBLACK);
     }
 }
@@ -918,22 +1172,34 @@ void SchematicCanvas::DrawDragOriginMarker(wxDC& dc, const SchematicSnapshot& sn
     if (!HasDragPreview()) {
         return;
     }
-    for (const ComponentInstance& component : snapshot.components) {
-        if (component.id != dragging_component_id_) {
+    for (std::size_t index = 0; index < drag_component_ids_.size(); ++index) {
+        const auto iterator = std::find_if(
+            snapshot.components.begin(), snapshot.components.end(),
+            [&drag_id = drag_component_ids_[index]](const ComponentInstance& component) {
+                return component.id == drag_id;
+            });
+        if (iterator == snapshot.components.end()) {
             continue;
         }
         const std::optional<ComponentDefinition> definition =
-            library_.FindByTypeId(component.type_id);
+            library_.FindByTypeId(iterator->type_id);
         if (!definition.has_value()) {
-            return;
+            continue;
         }
-        const wxPoint origin = ModelToScreen(drag_origin_position_);
+        const int quarter = NormalizeQuarterTurn(iterator->rotation_deg);
+        const wxPoint origin = ModelToScreen(drag_origin_positions_[index]);
         const int width = static_cast<int>(std::lround(definition->default_bounds.width * zoom_));
         const int height = static_cast<int>(std::lround(definition->default_bounds.height * zoom_));
+        const wxPoint center{origin.x + width / 2, origin.y + height / 2};
+        const wxPoint corners[4] = {
+            RotateScreenPoint({origin.x, origin.y}, center, quarter),
+            RotateScreenPoint({origin.x + width, origin.y}, center, quarter),
+            RotateScreenPoint({origin.x + width, origin.y + height}, center, quarter),
+            RotateScreenPoint({origin.x, origin.y + height}, center, quarter),
+        };
         dc.SetPen(wxPen(wxColour(150, 158, 170), 1, wxPENSTYLE_DOT));
         dc.SetBrush(*wxTRANSPARENT_BRUSH);
-        dc.DrawRectangle(origin.x, origin.y, width, height);
-        return;
+        dc.DrawPolygon(4, corners);
     }
 }
 

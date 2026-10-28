@@ -29,9 +29,11 @@ enum MainFrameCommandId {
     kMenuUndo,
     kMenuRedo,
     kMenuDelete,
+    kMenuSelectAll,
     kMenuSelectTool,
     kMenuWireTool,
     kMenuPanTool,
+    kMenuTextTool,
     kMenuRotate,
     kMenuZoomIn,
     kMenuZoomOut,
@@ -64,8 +66,10 @@ private:
     void OnSelectTool(wxCommandEvent& event);
     void OnWireTool(wxCommandEvent& event);
     void OnPanTool(wxCommandEvent& event);
+    void OnTextTool(wxCommandEvent& event);
     void OnRotate(wxCommandEvent& event);
     void OnDelete(wxCommandEvent& event);
+    void OnSelectAll(wxCommandEvent& event);
     void OnCreateComposite(wxCommandEvent& event);
     void OnUndo(wxCommandEvent& event);
     void OnRedo(wxCommandEvent& event);

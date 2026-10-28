@@ -12,12 +12,14 @@ enum class ToolMode {
     kSelect,
     kPlaceComponent,
     kWire,
-    kPan
+    kPan,
+    kText
 };
 
 struct SelectionState {
     std::vector<ComponentId> component_ids;
     std::vector<WireId> wire_ids;
+    std::vector<TextLabelId> text_label_ids;
 };
 
 class IEditorQuery {

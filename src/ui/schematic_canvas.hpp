@@ -66,12 +66,17 @@ private:
                            const ComponentDefinition& definition,
                            const PinDefinition& pin) const;
     Point2D RotateRelative(Point2D relative, Rect2D bounds, double rotation_deg) const;
+    // 屏幕坐标下的四分之一圈旋转，与 RotateRelative 用同一套公式：
+    // 元件图形旋转后必须和引脚圆点、命中测试落在同一位置。
+    wxPoint RotateScreenPoint(wxPoint point, wxPoint center, int quarter_turn) const;
     std::optional<ComponentId> HitComponent(Point2D model_point) const;
     std::optional<ComponentId> HitComponent(Point2D model_point,
                                             const SchematicSnapshot& snapshot) const;
     std::optional<PinHit> HitPin(Point2D model_point) const;
     std::optional<PinHit> HitPin(Point2D model_point, const SchematicSnapshot& snapshot) const;
     std::optional<WireId> HitWire(Point2D model_point) const;
+    std::optional<TextLabelId> HitTextLabel(Point2D model_point,
+                                            const SchematicSnapshot& snapshot) const;
     // 离光标最近的那条导线上的投影点：用于在导线中段接线（T 形相接）。
     std::optional<Point2D> HitWirePoint(Point2D model_point,
                                         const SchematicSnapshot& snapshot) const;
@@ -82,13 +87,19 @@ private:
                                     const SchematicSnapshot& snapshot) const;
     bool IsComponentSelected(ComponentId component_id) const;
     bool IsWireSelected(WireId wire_id) const;
-    // 拖动预览：把拖动中的元件换成预览坐标，挂在它引脚上的导线于是跟着走。
+    bool IsTextLabelSelected(TextLabelId label_id) const;
+    // 拖动预览：把拖动中的元件换成预览坐标，挂在它引脚上的导线于是跟着走；
+    // 这些导线的旧拐点是按挪动前的位置存的，预览里一并清空让其按新几何重算。
     void ApplyDragPreview(SchematicSnapshot& snapshot) const;
     bool HasDragPreview() const;
     void BeginComponentDrag(ComponentId component_id, Point2D press_model);
     void EndComponentDrag();
     // 右键或捕获丢失打断拖动：这次移动不提交，元件留在原处。
     void AbortComponentDrag();
+    void BeginTextLabelDrag(TextLabelId label_id, Point2D press_model);
+    void EndTextLabelDrag();
+    void AbortTextLabelDrag();
+    bool HasTextLabelDragPreview() const;
     // 待画折线到 target 这一跳的正交路径（含自动避让），提交和预览共用。
     std::vector<Point2D> PlanSegmentTo(const editor::PendingWire& pending_wire,
                                        const WireTarget& target) const;
@@ -97,6 +108,7 @@ private:
     void DrawGrid(wxDC& dc);
     void DrawWires(wxDC& dc, const SchematicSnapshot& snapshot);
     void DrawComponents(wxDC& dc, const SchematicSnapshot& snapshot);
+    void DrawTextLabels(wxDC& dc, const SchematicSnapshot& snapshot);
     void DrawDragOriginMarker(wxDC& dc, const SchematicSnapshot& snapshot);
     void DrawTemporaryWire(wxDC& dc);
     void RefreshEditorViews();
@@ -110,11 +122,18 @@ private:
     double offset_x_{40.0};
     double offset_y_{40.0};
     Point2D last_mouse_model_;
+    // 元件拖动：Shift 多选后整体拖，ids 与 origin/preview 一一对应。
     bool dragging_component_{false};
-    ComponentId dragging_component_id_{kInvalidComponentId};
-    Point2D drag_origin_position_;
+    std::vector<ComponentId> drag_component_ids_;
+    std::vector<Point2D> drag_origin_positions_;
     Point2D drag_press_model_;
-    std::optional<Point2D> drag_preview_position_;
+    std::optional<std::vector<Point2D>> drag_preview_positions_;
+    // 文本标注拖动。
+    bool dragging_label_{false};
+    TextLabelId dragging_label_id_{kInvalidTextLabelId};
+    Point2D label_drag_origin_position_;
+    Point2D label_drag_press_model_;
+    std::optional<Point2D> label_drag_preview_position_;
     std::optional<ComponentId> hover_component_id_;
     Point2D pan_start_offset_;
     wxPoint pan_start_screen_;

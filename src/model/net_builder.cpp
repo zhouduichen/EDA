@@ -83,12 +83,17 @@ BuiltNetlist BuildNets(const SchematicSnapshot& snapshot, const IComponentLibrar
     }
 
     // 2. 编号：前 wires.size() 个节点是导线，其后每个出现过的引脚一个节点。
+    //    "删除元件不连带删线"会留下指向已删元件的幽灵引脚——不认识元件的引脚
+    //    直接丢弃，否则网络名会被幽灵位号污染、网络里混进不存在的引脚。
+    const auto pin_is_live = [&references](const std::optional<PinRef>& pin) {
+        return pin.has_value() && references.count(pin->component_id) != 0;
+    };
     std::vector<std::uint64_t> pin_keys;
     for (const WireModel& wire : snapshot.wires) {
-        if (wire.from.pin.has_value()) {
+        if (pin_is_live(wire.from.pin)) {
             pin_keys.push_back(PinKey(wire.from.pin->component_id, wire.from.pin->pin_id));
         }
-        if (wire.to.pin.has_value()) {
+        if (pin_is_live(wire.to.pin)) {
             pin_keys.push_back(PinKey(wire.to.pin->component_id, wire.to.pin->pin_id));
         }
     }
@@ -107,11 +112,11 @@ BuiltNetlist BuildNets(const SchematicSnapshot& snapshot, const IComponentLibrar
     // 3. 端点挂引脚 → 导线与引脚同网。
     for (std::size_t index = 0; index < wire_count; ++index) {
         const WireModel& wire = snapshot.wires[index];
-        if (wire.from.pin.has_value()) {
+        if (pin_is_live(wire.from.pin)) {
             sets.Union(index, pin_nodes.at(PinKey(wire.from.pin->component_id,
                                                   wire.from.pin->pin_id)));
         }
-        if (wire.to.pin.has_value()) {
+        if (pin_is_live(wire.to.pin)) {
             sets.Union(index, pin_nodes.at(PinKey(wire.to.pin->component_id,
                                                   wire.to.pin->pin_id)));
         }

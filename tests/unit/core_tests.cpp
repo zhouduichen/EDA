@@ -2,6 +2,7 @@
 // 测试文件必须取消 NDEBUG，让断言在任何配置下都真正执行。
 #undef NDEBUG
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -837,7 +838,8 @@ void TestEditorCommandsAndWireWorkflow() {
     editor.SelectComponent(gate_id);
     assert(editor.DeleteSelection());
     assert(editor.GetSnapshot().components.size() == 1);
-    assert(editor.GetSnapshot().wires.empty());
+    // 删除元件不再连带删除挂在上面的导线：线保留，端点退化为自由坐标。
+    assert(editor.GetSnapshot().wires.size() == 1);
     assert(editor.Undo());
     assert(editor.GetSnapshot().components.size() == 2);
     assert(editor.GetSnapshot().wires.size() == 1);
@@ -870,7 +872,10 @@ void TestEditorCommandsAndWireWorkflow() {
         const std::string content((std::istreambuf_iterator<char>(stream)),
                                   std::istreambuf_iterator<char>());
         stream.close();
-        std::filesystem::remove(path);
+        // 设 CSE_KEEP_EXPORT=1 时保留导出文件，供 kicad-cli 人工复核。
+        if (std::getenv("CSE_KEEP_EXPORT") == nullptr) {
+            std::filesystem::remove(path);
+        }
 
         // 文件头必须是 KiCad 6 格式，更新的 KiCad 打开时会自动升级。
         assert(content.rfind("(kicad_sch (version 20211123)", 0) == 0);
@@ -893,8 +898,9 @@ void TestEditorCommandsAndWireWorkflow() {
         assert(content.find("(sheet_instances") != std::string::npos);
         assert(content.find("(symbol_instances") != std::string::npos);
         // 旋转后的引脚坐标必须和导线端点一致（预旋转符号 + 实例角度 0）。
-        assert(content.find("(xy 138.430000 48.260000)") != std::string::npos);
-        assert(content.find("(xy 152.400000 48.260000)") != std::string::npos);
+        // 内容整体平移进图纸（min 坐标 0 → 边距 20mm），坐标随之 +20。
+        assert(content.find("(xy 158.430000 68.260000)") != std::string::npos);
+        assert(content.find("(xy 172.400000 68.260000)") != std::string::npos);
         // 占位封装和自定义 label 也要带过去。
         assert(content.find("(footprint \"Package_DIP:DIP-14_W7.62mm\")") !=
                std::string::npos);
@@ -943,7 +949,8 @@ void TestEditorCommandsAndWireWorkflow() {
         std::filesystem::remove(path);
 
         // 竖线端点落在横线中段 → T 形接点，必须显式写 junction。
-        assert(content.find("(junction (at 12.700000 0.000000)") != std::string::npos);
+        // 内容整体平移进图纸（min 坐标 0 → 边距 20mm）。
+        assert(content.find("(junction (at 32.700000 20.000000)") != std::string::npos);
     }
 
     void TestKiCadSchematicRotatedConnection() {
@@ -1058,9 +1065,233 @@ void TestEditorCommandsAndWireWorkflow() {
         assert(content.find("(reference \"U1\")") != std::string::npos);
     }
 
+    // 直线被别的引脚/元件挡住时必须绕行，不能从上面碾过去（连线重合 bug）。
+    void TestWireRouteDetoursAroundObstacle() {
+        cse::component::ComponentLibrary library;
+        cse::SchematicSnapshot snapshot;
+        // io.output 的引脚在左边缘中部：放在 (50,-15) 时引脚正好落在 (50,0)，
+        // 挡在 (0,0)→(100,0) 的直线上，元件本体也压在这条线上。
+        snapshot.components.push_back(MakeComponent(1, "io.output", "OUT1", 50.0, -15.0));
+
+        const std::vector<cse::Point2D> detour = cse::model::PlanWireRoute(
+            snapshot, library, {0.0, 0.0}, {100.0, 0.0}, std::nullopt, std::nullopt);
+        assert(!detour.empty());  // 直线被挡，必须给出绕行拐点
+        for (const cse::Point2D& point : detour) {
+            assert(point.y != 0.0);  // 拐点不在被挡的直线上
+        }
+
+        // 没有障碍时保持直线。
+        cse::SchematicSnapshot empty;
+        assert(cse::model::PlanWireRoute(empty, library, {0.0, 0.0}, {100.0, 0.0},
+                                         std::nullopt, std::nullopt).empty());
+    }
+
+    // 完全相同的连接只允许画一条（正画/反画都算重复）。
+    void TestDuplicateWireRejected() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId input_id = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("logic.and");
+        assert(editor.PlaceComponent({200.0, 0.0}));
+        const cse::ComponentId gate_id = editor.GetSelection().component_ids.front();
+
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.CompleteWire({gate_id, 1}, {200.0, 15.0}));
+        assert(editor.GetSnapshot().wires.size() == 1);
+
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(!editor.CompleteWire({gate_id, 1}, {200.0, 15.0}));
+        assert(editor.GetSnapshot().wires.size() == 1);
+
+        // 反方向也算同一条连接。
+        assert(editor.BeginWire({gate_id, 1}, {200.0, 15.0}));
+        assert(!editor.CompleteWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.GetSnapshot().wires.size() == 1);
+    }
+
+    // 元件挪动后，挂在它引脚上的导线按新几何重算拐点，旧拐点作废。
+    void TestMoveReplansAttachedWireRoute() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId input_id = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("logic.and");
+        assert(editor.PlaceComponent({200.0, 0.0}));
+        const cse::ComponentId gate_id = editor.GetSelection().component_ids.front();
+
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.AddWireBend({100.0, 200.0}));
+        assert(editor.CompleteWire({gate_id, 1}, {200.0, 15.0}));
+        {
+            const cse::SchematicSnapshot snapshot = editor.GetSnapshot();
+            const cse::WireModel& wire = snapshot.wires.front();
+            const bool has_old_bend = std::any_of(
+                wire.route_points.begin(), wire.route_points.end(),
+                [](const cse::Point2D& point) { return point.x == 100.0 && point.y == 200.0; });
+            assert(has_old_bend);
+        }
+
+        assert(editor.MoveComponent(gate_id, {200.0, 300.0}));
+        // GetSnapshot 返回临时对象，必须先拷贝下来再取引用。
+        const cse::SchematicSnapshot moved_snapshot = editor.GetSnapshot();
+        const cse::WireModel& wire = moved_snapshot.wires.front();
+        for (const cse::Point2D& point : wire.route_points) {
+            assert(!(point.x == 100.0 && point.y == 200.0));  // 旧拐点不能再出现
+        }
+        // 撤销移动：拐点恢复原样。
+        assert(editor.Undo());
+        const cse::SchematicSnapshot restored_snapshot = editor.GetSnapshot();
+        const cse::WireModel& restored = restored_snapshot.wires.front();
+        const bool has_old_bend = std::any_of(
+            restored.route_points.begin(), restored.route_points.end(),
+            [](const cse::Point2D& point) { return point.x == 100.0 && point.y == 200.0; });
+        assert(has_old_bend);
+    }
+
+    void TestTextLabelWorkflow() {
+                cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+
+        const cse::Result<cse::TextLabelId> added = editor.AddTextLabel({12.0, 17.0}, "A=B+C");
+                assert(added.ok);
+        assert(editor.GetSnapshot().text_labels.size() == 1);
+        assert(editor.GetSnapshot().text_labels.front().text == "A=B+C");
+        assert(editor.GetSnapshot().text_labels.front().position.x == 10.0);  // 吸附网格
+        assert(editor.GetSelection().text_label_ids.front() == added.value);
+
+        // 空文本（含纯空白）拒绝。
+                assert(!editor.AddTextLabel({0.0, 0.0}, "   ").ok);
+
+                assert(editor.MoveTextLabel(added.value, {40.0, 60.0}));
+                assert(editor.GetSnapshot().text_labels.front().position.y == 60.0);
+        assert(editor.Undo());
+        assert(editor.GetSnapshot().text_labels.front().position.y == 20.0);
+        assert(editor.Redo());
+
+        editor.SelectTextLabel(added.value);
+                assert(editor.DeleteSelection());
+                assert(editor.GetSnapshot().text_labels.empty());
+        assert(editor.Undo());
+                assert(editor.GetSnapshot().text_labels.size() == 1);
+    }
+
+    void TestTextLabelPersistence() {
+        cse::SchematicSnapshot snapshot;
+        cse::TextLabel label;
+        label.id = 1;
+        label.position = {30.0, 40.0};
+        label.text = "节点 \"A\" 与 B";
+        snapshot.text_labels.push_back(label);
+
+        const std::string path = "cse_test_text_label.cseproj";
+        assert(cse::io::SaveProject(snapshot, path).ok);
+        const cse::Result<cse::SchematicSnapshot> loaded = cse::io::LoadProject(path);
+        assert(loaded.ok);
+        assert(loaded.value.text_labels.size() == 1);
+        assert(loaded.value.text_labels.front().text == label.text);
+        assert(loaded.value.text_labels.front().position.x == 30.0);
+        std::filesystem::remove(path);
+    }
+
+    void TestSelectAll() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId input_id = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("logic.and");
+        assert(editor.PlaceComponent({200.0, 0.0}));
+        const cse::ComponentId gate_id = editor.GetSelection().component_ids.front();
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.CompleteWire({gate_id, 1}, {200.0, 15.0}));
+        assert(editor.AddTextLabel({10.0, 300.0}, "note").ok);
+
+        editor.SelectAll();
+        const cse::SelectionState selection = editor.GetSelection();
+        assert(selection.component_ids.size() == 2);
+        assert(selection.wire_ids.size() == 1);
+        assert(selection.text_label_ids.size() == 1);
+
+        assert(editor.DeleteSelection());
+        assert(editor.GetSnapshot().components.empty());
+        assert(editor.GetSnapshot().wires.empty());
+        assert(editor.GetSnapshot().text_labels.empty());
+        assert(editor.Undo());
+        assert(editor.GetSnapshot().components.size() == 2);
+        assert(editor.GetSnapshot().wires.size() == 1);
+        assert(editor.GetSnapshot().text_labels.size() == 1);
+    }
+
+    // 方向键连续微调并进同一条撤销命令：Ctrl+Z 一次退回整段微调之前。
+    void TestArrowNudgeCoalescesUndo() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId id = editor.GetSelection().component_ids.front();
+
+        assert(editor.MoveComponents({id}, {{10.0, 0.0}}, false));  // 拖动提交
+        assert(editor.MoveComponents({id}, {{20.0, 0.0}}, true));   // 连续微调
+        assert(editor.MoveComponents({id}, {{30.0, 0.0}}, true));
+        assert(editor.MoveComponents({id}, {{40.0, 0.0}}, true));
+        assert(editor.GetComponent(id)->position.x == 40.0);
+        assert(editor.Undo());
+        assert(editor.GetComponent(id)->position.x == 10.0);
+        assert(editor.Redo());
+        assert(editor.GetComponent(id)->position.x == 40.0);
+    }
+
+    // 删除元件后保留的导线带幽灵引脚（指向已删元件）：
+    // 建网时必须丢弃幽灵引脚，网络里不能混进不存在的引脚。
+    void TestGhostPinIgnoredAfterDelete() {
+        cse::model::SchematicModel model;
+        cse::component::ComponentLibrary library;
+        cse::component::ComponentFactory factory(library);
+        cse::editor::EditorController editor(model, library, factory);
+        editor.SetPlacementType("io.input");
+        assert(editor.PlaceComponent({0.0, 0.0}));
+        const cse::ComponentId input_id = editor.GetSelection().component_ids.front();
+        editor.SetPlacementType("logic.and");
+        assert(editor.PlaceComponent({200.0, 0.0}));
+        const cse::ComponentId gate_id = editor.GetSelection().component_ids.front();
+        editor.SetToolMode(cse::ToolMode::kWire);
+        assert(editor.BeginWire({input_id, 1}, {50.0, 15.0}));
+        assert(editor.CompleteWire({gate_id, 1}, {200.0, 15.0}));
+
+        editor.SelectComponent(gate_id);
+        assert(editor.DeleteSelection());
+
+        const cse::model::BuiltNetlist netlist =
+            cse::model::BuildNets(editor.GetSnapshot(), library);
+        // 网络里只剩 IN1 的活引脚，幽灵引脚不能出现。
+        assert(netlist.nets.size() == 1);
+        assert(netlist.nets[0].pins.size() == 1);
+        assert(netlist.nets[0].pins[0].component_id == input_id);
+    }
+
 }  // namespace
 
 int main() {
+#ifdef _MSC_VER
+    // 断言失败只打印到终端，不在桌面弹 "Debug Error" 对话框。
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
     TestComponentLibraryAndFactory();
     TestModelCrudAndRevision();
     TestEditorCommandsAndWireWorkflow();
@@ -1088,5 +1319,13 @@ int main() {
     TestKiCadSchematicRejectsLooseConnection();
     TestKiCadSchematicValidation();
     TestKiCadSchematicExportsComposite();
+    TestWireRouteDetoursAroundObstacle();
+    TestDuplicateWireRejected();
+    TestMoveReplansAttachedWireRoute();
+    TestTextLabelWorkflow();
+    TestTextLabelPersistence();
+    TestSelectAll();
+    TestArrowNudgeCoalescesUndo();
+    TestGhostPinIgnoredAfterDelete();
     return 0;
 }

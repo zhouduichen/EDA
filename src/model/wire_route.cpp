@@ -74,9 +74,11 @@ namespace {
             }
         }
         for (const WireModel& wire : snapshot.wires) {
-            obstacles.push_back(ResolveWireEndpoint(snapshot, library, wire.from));
-            obstacles.push_back(ResolveWireEndpoint(snapshot, library, wire.to));
-            obstacles.insert(obstacles.end(), wire.route_points.begin(), wire.route_points.end());
+            // 其它导线的端点不避让：端点落在本线线段上是合法的 T 形相接
+            //（建网就按这条规则连网），避让反而会把本该相连的线绕开。
+            // 拐点仍然避让——拐点压在本线上只是几何重叠，建网不会连。
+            obstacles.insert(obstacles.end(), wire.route_points.begin(),
+                             wire.route_points.end());
         }
         // 和自己两端重合的点不算障碍——导线本来就该从这两个点出发。
         obstacles.erase(std::remove_if(obstacles.begin(), obstacles.end(),
@@ -87,13 +89,85 @@ namespace {
         return obstacles;
     }
 
+    // 走线要绕开的面：其它元件旋转后的外接矩形（不含本线两端所在的元件——
+    // 导线本来就要从它们的引脚上出发，贴着边界走是正常的）。
+    std::vector<Rect2D> CollectBodyObstacles(const SchematicSnapshot& snapshot,
+                                             const IComponentLibrary& library,
+                                             const std::optional<PinRef>& from_pin,
+                                             const std::optional<PinRef>& to_pin) {
+        std::vector<Rect2D> bodies;
+        for (const ComponentInstance& component : snapshot.components) {
+            bool is_endpoint_owner = false;
+            if (from_pin.has_value() && from_pin->component_id == component.id) {
+                is_endpoint_owner = true;
+            }
+            if (to_pin.has_value() && to_pin->component_id == component.id) {
+                is_endpoint_owner = true;
+            }
+            if (is_endpoint_owner) {
+                continue;
+            }
+            const std::optional<ComponentDefinition> definition =
+                library.FindByTypeId(component.type_id);
+            if (!definition.has_value()) {
+                continue;
+            }
+            const Rect2D relative =
+                RotatedComponentBounds(*definition, component.rotation_deg);
+            bodies.push_back({component.position.x + relative.x,
+                              component.position.y + relative.y, relative.width, relative.height});
+        }
+        return bodies;
+    }
+
+    // 线段是否穿过矩形内部（向内收缩 shrink：贴着边/引脚从边界出发不算穿过）。
+    bool SegmentCrossesRect(Point2D start, Point2D end, Rect2D rect) {
+        constexpr double kShrink = 0.5;
+        const double left = rect.x + kShrink;
+        const double right = rect.x + rect.width - kShrink;
+        const double top = rect.y + kShrink;
+        const double bottom = rect.y + rect.height - kShrink;
+        if (right <= left || bottom <= top) {
+            return false;
+        }
+        const auto inside = [left, right, top, bottom](Point2D point) {
+            return point.x > left && point.x < right && point.y > top && point.y < bottom;
+        };
+        if (inside(start) || inside(end)) {
+            return true;
+        }
+        // 与四条边做严格相交测试（共线/端点落在边上不算）。
+        const auto orientation = [](Point2D a, Point2D b, Point2D c) {
+            const double value = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            return value > 0.0 ? 1 : (value < 0.0 ? -1 : 0);
+        };
+        const auto segments_strictly_cross = [&](Point2D a, Point2D b, Point2D c, Point2D d) {
+            return orientation(a, b, c) * orientation(a, b, d) < 0 &&
+                   orientation(c, d, a) * orientation(c, d, b) < 0;
+        };
+        const Point2D corners[4] = {{left, top}, {right, top}, {right, bottom}, {left, bottom}};
+        for (int index = 0; index < 4; ++index) {
+            if (segments_strictly_cross(start, end, corners[index],
+                                        corners[(index + 1) % 4])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool TouchesObstacle(const std::vector<Point2D>& polyline,
-                         const std::vector<Point2D>& obstacles) {
+                         const std::vector<Point2D>& obstacles,
+                         const std::vector<Rect2D>& bodies) {
         const double epsilon_squared = kRouteEpsilon * kRouteEpsilon;
         for (std::size_t index = 1; index < polyline.size(); ++index) {
             for (Point2D obstacle : obstacles) {
                 if (DistanceToSegmentSquared(obstacle, polyline[index - 1], polyline[index]) <=
                     epsilon_squared) {
+                    return true;
+                }
+            }
+            for (const Rect2D& body : bodies) {
+                if (SegmentCrossesRect(polyline[index - 1], polyline[index], body)) {
                     return true;
                 }
             }
@@ -103,16 +177,36 @@ namespace {
 
     // 候选走法，越自然的排越前：先让位移大的那个方向当第一段（导线从引脚正前方出来），
     // 不行再折中——把中间那条竖线/横线放到两端的中间位置，绕开挡路的引脚。
+    // 两端已经同行/同列时四个候选全退化成同一条直线，所以再补两组平移绕行的走法：
+    // 直线上有别的引脚/元件时，至少有一条能绕开（否则两个引脚之间根本连不上）。
     std::vector<std::vector<Point2D>> RouteCandidates(Point2D from, Point2D to) {
         const Point2D middle{(from.x + to.x) / 2.0, (from.y + to.y) / 2.0};
         const std::vector<Point2D> horizontal_first{{to.x, from.y}};
         const std::vector<Point2D> vertical_first{{from.x, to.y}};
         const std::vector<Point2D> middle_column{{middle.x, from.y}, {middle.x, to.y}};
         const std::vector<Point2D> middle_row{{from.x, middle.y}, {to.x, middle.y}};
+        std::vector<std::vector<Point2D>> candidates;
         if (std::abs(to.x - from.x) >= std::abs(to.y - from.y)) {
-            return {horizontal_first, vertical_first, middle_column, middle_row};
+            candidates = {horizontal_first, vertical_first, middle_column, middle_row};
+        } else {
+            candidates = {vertical_first, horizontal_first, middle_row, middle_column};
         }
-        return {vertical_first, horizontal_first, middle_row, middle_column};
+        constexpr double kDetourOffset = 2.0 * kDefaultGridSize;
+        const bool same_row = std::abs(to.y - from.y) < kRouteEpsilon;
+        const bool same_column = std::abs(to.x - from.x) < kRouteEpsilon;
+        if (same_row) {
+            candidates.push_back({{from.x, from.y - kDetourOffset},
+                                  {to.x, from.y - kDetourOffset}});
+            candidates.push_back({{from.x, from.y + kDetourOffset},
+                                  {to.x, from.y + kDetourOffset}});
+        }
+        if (same_column) {
+            candidates.push_back({{from.x - kDetourOffset, from.y},
+                                  {from.x - kDetourOffset, to.y}});
+            candidates.push_back({{from.x + kDetourOffset, from.y},
+                                  {from.x + kDetourOffset, to.y}});
+        }
+        return candidates;
     }
 
     std::vector<Point2D> BuildPolyline(Point2D from, const std::vector<Point2D>& route_points,
@@ -232,16 +326,23 @@ std::vector<Point2D> PlanWireRoute(const SchematicSnapshot& snapshot,
     if (SamePoint(from, to)) {
         return {};
     }
-    // 已经同列或同行：直线就是正交的，不需要拐点。
-    if (std::abs(from.x - to.x) < kRouteEpsilon || std::abs(from.y - to.y) < kRouteEpsilon) {
-        return {};
-    }
 
     const std::vector<Point2D> obstacles =
         CollectObstacles(snapshot, library, from, to, from_pin, to_pin);
-    const std::vector<std::vector<Point2D>> candidates = RouteCandidates(from, to);
+    const std::vector<Rect2D> bodies =
+        CollectBodyObstacles(snapshot, library, from_pin, to_pin);
+    std::vector<std::vector<Point2D>> candidates = RouteCandidates(from, to);
+    // 与端点重合的拐点是零长度段（同行/同列时天然出现），先滤掉。
+    for (std::vector<Point2D>& candidate : candidates) {
+        candidate.erase(std::remove_if(candidate.begin(), candidate.end(),
+                                       [from, to](Point2D point) {
+                                           return SamePoint(point, from) ||
+                                                  SamePoint(point, to);
+                                       }),
+                        candidate.end());
+    }
     for (const std::vector<Point2D>& candidate : candidates) {
-        if (!TouchesObstacle(BuildPolyline(from, candidate, to), obstacles)) {
+        if (!TouchesObstacle(BuildPolyline(from, candidate, to), obstacles, bodies)) {
             return candidate;
         }
     }

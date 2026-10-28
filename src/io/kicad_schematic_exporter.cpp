@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <iomanip>
 #include <locale>
 #include <map>
@@ -443,13 +444,49 @@ Result<void> ExportKiCadSchematic(const SchematicSnapshot& snapshot,
     }
 
     bool has_loose_connection = false;
-    const std::vector<Point2D> junctions =
-        CollectJunctions(polylines, &has_loose_connection);
+    std::vector<Point2D> junctions = CollectJunctions(polylines, &has_loose_connection);
     if (has_loose_connection) {
         return Result<void>::Failure(
             ErrorCode::kInvalidConnection,
             "wire endpoints connect within tolerance but are not exactly coincident; "
             "KiCad would see a different net. Move/regrid the wires before exporting.");
+    }
+
+    // KiCad 图纸原点在页面左上角，而编辑器坐标可以为负——不平移的话
+    // 负坐标内容会画到页面之外，打开后"少一半图"。算出内容包围盒，
+    // 整体平移到留出边距的位置（元件、导线、结点一起动，相对关系不变）。
+    constexpr double kPageMargin = 20.0;
+    double content_min_x = std::numeric_limits<double>::max();
+    double content_min_y = std::numeric_limits<double>::max();
+    for (const ComponentInstance& component : components) {
+        const int quarter = QuarterTurn(component.rotation_deg);
+        const SymbolSpec& spec = symbols.at(std::make_pair(component.type_id, quarter));
+        content_min_x = std::min(content_min_x, component.position.x * kScale + spec.x);
+        content_min_y = std::min(content_min_y, component.position.y * kScale + spec.y);
+    }
+    for (const std::vector<Point2D>& polyline : polylines) {
+        for (const Point2D& point : polyline) {
+            content_min_x = std::min(content_min_x, point.x * kScale);
+            content_min_y = std::min(content_min_y, point.y * kScale);
+        }
+    }
+    const double shift_x = content_min_x < kPageMargin ? kPageMargin - content_min_x : 0.0;
+    const double shift_y = content_min_y < kPageMargin ? kPageMargin - content_min_y : 0.0;
+    if (shift_x != 0.0 || shift_y != 0.0) {
+        for (ComponentInstance& component : components) {
+            component.position.x += shift_x / kScale;
+            component.position.y += shift_y / kScale;
+        }
+        for (std::vector<Point2D>& polyline : wire_polylines) {
+            for (Point2D& point : polyline) {
+                point.x += shift_x / kScale;
+                point.y += shift_y / kScale;
+            }
+        }
+        for (Point2D& junction : junctions) {
+            junction.x += shift_x / kScale;
+            junction.y += shift_y / kScale;
+        }
     }
 
     double content_max_x = 0.0;
