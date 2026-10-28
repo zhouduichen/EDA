@@ -58,6 +58,15 @@ msbuild Project1.slnx /p:Configuration=Release /p:Platform=x64
 | `canvas.h` / `canvas.cpp` | `CircuitCanvas`：绘制与全部鼠标 / 键盘交互——工具、走线、选中、移动修复、撤销重做、缩放、PNG 导出 |
 | `wirenet.h` / `wirenet.cpp` | 正交导线几何与电气网络提取：连接规则、最短正交走线、避障布线、WireRepair 位移重铺。只认识网格点与折线，不依赖 wxString / wxDC，可独立测试 |
 
+## 测试与验证
+
+仓库根目录的 `_check/` 保存不依赖 GUI 交互的验证脚本（bash + MSVC）：
+
+- `wirenet_check.sh`：编译并运行导线几何 / 建网模块的独立单元测试（配合 `stub/wx` 头文件桩，无需链接 wxWidgets）
+- `model_check.sh`：编译并运行模型层冒烟测试（仅依赖 wxBase）
+- `compile_check.sh` / `link_check.sh`：完整 GUI 程序的编译 / 链接检查
+- `build_exe.sh`：以 Release 配置静态链接 wxWidgets，产出自包含可执行文件 `LogicSim.exe` 并放到桌面
+
 ## 工程文件格式
 
 `.circ` 为 UTF-8 纯文本工程文件，包含工程内全部电路（子电路定义因此可以跨电路存活）。每个电路形如：
