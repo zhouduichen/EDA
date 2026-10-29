@@ -10,18 +10,18 @@ set -u
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
-VS='C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231'
+VS='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231'
 BIN="$VS\\bin\\Hostx64\\x64"
 MSVCINC="$VS\\include"
 MSVCLIB="$VS\\lib\\x64"
-KIT='C:\Program Files (x86)\Windows Kits\10'
+KIT='D:\Windows Kits\10'
 SDKV='10.0.26100.0'
-RC="$KIT\\bin\\$SDKV\\x64\\rc.exe"     # the resource compiler lives in the SDK
+RC="$KIT\\bin\\${SDKV}\\x64\\rc.exe"     # the resource compiler lives in the SDK
 # link.exe shells out to rc.exe when it embeds the manifest, so it must be
 # reachable through PATH.
-export PATH="/c/Program Files (x86)/Windows Kits/10/bin/$SDKV/x64:$PATH"
-WX='F:\EDA\basic\basic_tools\wxWidgets-3.2.2.1'
-SRC='F:\EDA\wxWidgets_project\Project1'
+export PATH="/c/Program Files (x86)/Windows Kits/10/bin/${SDKV}/x64:$PATH"
+WX='C:\wxWidgets-3.2.2.1'
+SRC='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\Project1'
 CHK='F:\EDA\wxWidgets_project\_check'
 OUT="$CHK\\build"
 DESK='C:\Users\34854\Desktop'
@@ -32,16 +32,16 @@ rm -f "$EXE"
 
 # NB: every /I must stay one quoted argument -- these paths contain spaces.
 INC=("/I$WX\\include" "/I$WX\\include\\msvc" "/I$MSVCINC"
-     "/I$KIT\\Include\\$SDKV\\ucrt" "/I$KIT\\Include\\$SDKV\\um"
-     "/I$KIT\\Include\\$SDKV\\shared" "/I$KIT\\Include\\$SDKV\\winrt"
+     "/I$KIT\\Include\\${SDKV}\\ucrt" "/I$KIT\\Include\\${SDKV}\\um"
+     "/I$KIT\\Include\\${SDKV}\\shared" "/I$KIT\\Include\\${SDKV}\\winrt"
      "/I$SRC")
 
 # ---------------------------------------------------------------- resources
 # NB: every /I must stay one quoted argument -- these paths contain spaces.
 echo "--- resources ---"
 RCINC=("/I$WX\\include" "/I$WX\\include\\msvc"
-       "/I$KIT\\Include\\$SDKV\\um" "/I$KIT\\Include\\$SDKV\\shared"
-       "/I$KIT\\Include\\$SDKV\\ucrt")
+       "/I$KIT\\Include\\${SDKV}\\um" "/I$KIT\\Include\\${SDKV}\\shared"
+       "/I$KIT\\Include\\${SDKV}\\ucrt")
 "$RC" /nologo /D_UNICODE /DUNICODE "${RCINC[@]}" /fo"$OUT\\app.res" "$CHK\\app.rc"
 if [ $? -ne 0 ]; then echo "rc failed"; exit 1; fi
 
@@ -59,7 +59,7 @@ echo "--- link ---"
 "$BIN\\link.exe" /nologo /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /MANIFEST:EMBED \
   /LIBPATH:"$WX\\lib\\vc_x64_lib" /LIBPATH:"$MSVCLIB" \
-  /LIBPATH:"$KIT\\Lib\\$SDKV\\ucrt\\x64" /LIBPATH:"$KIT\\Lib\\$SDKV\\um\\x64" \
+  /LIBPATH:"$KIT\\Lib\\${SDKV}\\ucrt\\x64" /LIBPATH:"$KIT\\Lib\\${SDKV}\\um\\x64" \
   /OUT:"$EXE" \
   "$OUT\\main.obj" "$OUT\\mainframe.obj" "$OUT\\canvas.obj" \
   "$OUT\\model.obj" "$OUT\\wirenet.obj" "$OUT\\eda.obj" "$OUT\\app.res" \

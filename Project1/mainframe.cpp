@@ -3,6 +3,7 @@
 ///////////////////////////////////////////////////////////////////////////
 
 #include "mainframe.h"
+#include "netlist.h"
 
 #include <wx/file.h>
 #include <wx/filedlg.h>
@@ -340,6 +341,18 @@ void MainFrame::BuildTree()
 
 void MainFrame::SetupMenus()
 {
+    // The generated resource has no netlist entry; put one next to "导出图像".
+    // Must happen before BindMenu(), which walks the items it finds.
+    if (File)
+    {
+        wxMenuItem* img = FindByLabel(File, wxT("导出图像"));
+        size_t pos = File->GetMenuItemCount();
+        for (size_t i = 0; i < File->GetMenuItemCount(); ++i)
+            if (File->FindItemByPosition(i) == img) { pos = i + 1; break; }
+        File->Insert(pos, wxID_ANY, wxT("导出网表\tCtrl+E"),
+                     wxT("导出 KiCad 格式网表，可被 PCB 软件加载"));
+    }
+
     BindMenu(File,     &MainFrame::OnMenuFile);
     BindMenu(Edit,     &MainFrame::OnMenuEdit);
     BindMenu(Project,  &MainFrame::OnMenuProject);
@@ -404,7 +417,7 @@ void MainFrame::SetCurrentTool(int tool)
     {
         case TOOL_EDIT:   Status(wxT("编辑工具：选择、移动元件并绘制导线")); break;
         case TOOL_POKE:   Status(wxT("电平工具：单击输入引脚切换其电平")); break;
-        case TOOL_TEXT:   Status(wxT("文本工具：单击元件重命名，或单击空白处添加文本")); break;
+        case TOOL_TEXT:   Status(wxT("文本工具：单击空白处添加；单击文本编辑；拖动文本移动；Delete 删除")); break;
         default:          Status(wxT("放置") + TypeName(TypeForToolComponent(tool)) + wxT("：单击画布放置")); break;
     }
 }
@@ -727,6 +740,7 @@ void MainFrame::OnMenuFile(wxCommandEvent& e)
     else if (label == wxT("保存"))             DoSave(false);
     else if (label == wxT("另存为"))           DoSave(true);
     else if (label == wxT("导出图像"))         DoExportImage();
+    else if (label == wxT("导出网表"))         DoExportNetlist();
     else if (label == wxT("打印"))             Status(wxT("打印功能尚未实现"));
     else if (label == wxT("首选项..."))        Status(wxT("首选项功能尚未实现"));
     else if (label == wxT("退出"))             Close(true);
@@ -957,4 +971,34 @@ void MainFrame::DoExportImage()
     wxString path = dlg.GetPath();
     if (!path.Lower().EndsWith(wxT(".png"))) path += wxT(".png");
     m_canvas->ExportImage(path);
+}
+
+void MainFrame::DoExportNetlist()
+{
+    Circuit* c = m_canvas->GetCircuit();
+    if (!c) return;
+
+    wxFileDialog dlg(this, wxT("导出网表"), wxT(""), wxT("电路.net"),
+                     wxT("KiCad 网表 (*.net)|*.net"),
+                     wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dlg.ShowModal() != wxID_OK) return;
+    wxString path = dlg.GetPath();
+    if (!path.Lower().EndsWith(wxT(".net"))) path += wxT(".net");
+
+    const wxString text = ExportKiCadNetlist(*c, path);
+    if (text.IsEmpty())
+    {
+        wxMessageBox(wxT("生成网表失败。"), wxT("错误"), wxOK | wxICON_ERROR);
+        return;
+    }
+    wxFile f(path, wxFile::write);
+    if (!f.IsOpened())
+    {
+        wxMessageBox(wxT("无法写入文件。"), wxT("错误"), wxOK | wxICON_ERROR);
+        return;
+    }
+    const std::string utf8 = text.utf8_string();
+    f.Write(utf8.c_str(), utf8.size());
+    f.Close();
+    Status(wxT("已导出网表（电路 ") + c->name + wxT("）：") + path);
 }

@@ -28,8 +28,13 @@ _check/build/
 *.db
 
 # ------------------------------------------------------------ dead scaffolding
-# Early syntax-check experiment, kept on disk but not part of the project.
-_check/stub/
+# Minimal wx stub headers used by netlist_check.sh (builds without wxWidgets).
 
 # --------------------------------------------------------- WorkBuddy session data
 .workbuddy/
+
+# ------------------------------------------------------------ session artifacts
+工业软件创新训练I-任务描述*.pdf
+屏幕截图 *.png
+电路*.net
+.learnings/

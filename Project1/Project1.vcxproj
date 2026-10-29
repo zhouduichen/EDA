@@ -157,11 +157,13 @@
     <ClCompile Include="canvas.cpp" />
     <ClCompile Include="model.cpp" />
     <ClCompile Include="wirenet.cpp" />
+    <ClCompile Include="netlist.cpp" />
     <ClCompile Include="eda.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="model.h" />
     <ClInclude Include="wirenet.h" />
+    <ClInclude Include="netlist.h" />
     <ClInclude Include="canvas.h" />
     <ClInclude Include="mainframe.h" />
     <ClInclude Include="eda.h" />

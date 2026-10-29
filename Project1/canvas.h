@@ -145,6 +145,11 @@ private:
 
     bool m_moving = false;
     bool m_moveSnapshotted = false;
+    bool m_movingText = false;
+    bool m_textMoveSnapshotted = false;
+    bool m_textMoved = false;
+    int  m_textDragIndex = -1;
+    std::vector<wxPoint> m_textMoveOrigins;
     bool m_movingWire = false;
     bool m_wireMoveSnapshotted = false;
     bool m_wireBranchPending = false;
@@ -248,8 +253,11 @@ private:
     void OnPokeClick(const wxMouseEvent& e);
     void OnTextClick(const wxMouseEvent& e);
     void OnMoveDrag(const wxMouseEvent& e);
+    void OnTextMoveDrag(const wxMouseEvent& e);
     void OnWireMoveDrag(const wxMouseEvent& e);
     void OnWireEndDrag(const wxMouseEvent& e);
+    void EditTextLabel(int index);
+    void BeginTextDrag(int index, const wxMouseEvent& e);
 
     // Painting.
     void OnPaint(wxPaintEvent& e);

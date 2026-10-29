@@ -27,6 +27,9 @@
     <ClCompile Include="model.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="netlist.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="wirenet.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -36,6 +39,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="model.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="netlist.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="wirenet.h">

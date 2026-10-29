@@ -82,6 +82,7 @@ private:
     void DoOpen();
     void DoSave(bool saveAs);
     void DoExportImage();
+    void DoExportNetlist();
     void DoStatistics();
 };
 

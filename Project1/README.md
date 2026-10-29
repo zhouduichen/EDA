@@ -22,6 +22,12 @@
 - 连接规则（Logisim）：只有端点相接、端点接入另一根导线中段（T 形）或共线重叠才算电气连接；两根导线单纯交叉**不**连通；在交叉点双击可显式放置连接点强制连通
 - 移动元件时相连导线自动重铺拉伸（WireRepair），拉伸而不断裂；拖拽未选中导线 = 从该点分支布线，单击 = 选中，选中后拖拽 = 整条移动，拖拽端点 = 拉伸 / 缩短 / 转向
 
+**文件与网表**
+
+- 工程保存 / 打开（`.circ`，含全部电路与会话自动保存）
+- 网表导出：`文件 → 导出网表`（`Ctrl+E`）生成 KiCad 格式网表（`.net`，s-expression），面向 **KiCad PCB 编辑器的「文件 → 导入 → 网表」**（原理图编辑器的网表导入需要符号库，不适用）；连接关系与仿真共用同一套建网逻辑（`wnBuildNets`），子电路实例按黑盒元件导出，盒子边缘端口即其引脚。每个元件自动映射 KiCad 标准封装库（逻辑门 → 74xx 风格 DIP，引脚 → 2.54mm 排针），PCB 编辑器可直接放置
+- 导出 PNG 图像
+
 **仿真**
 
 - 组合逻辑求值：未知值（X）传播、多驱动冲突检测
@@ -57,13 +63,15 @@ msbuild Project1.slnx /p:Configuration=Release /p:Platform=x64
 | `model.h` / `model.cpp` | 与 GUI 无关的数据模型：`Circuit` / `Component` / `Wire` / `Port`、20 像素网格、组合逻辑求值（含子电路展开）、工程序列化 |
 | `canvas.h` / `canvas.cpp` | `CircuitCanvas`：绘制与全部鼠标 / 键盘交互——工具、走线、选中、移动修复、撤销重做、缩放、PNG 导出 |
 | `wirenet.h` / `wirenet.cpp` | 正交导线几何与电气网络提取：连接规则、最短正交走线、避障布线、WireRepair 位移重铺。只认识网格点与折线，不依赖 wxString / wxDC，可独立测试 |
+| `netlist.h` / `netlist.cpp` | 网表构建与 KiCad 格式导出：在 `wnBuildNets` 的结果上把每个网络映射为元件引用 / 引脚名，输出 s-expression 文本 |
 
 ## 测试与验证
 
 仓库根目录的 `_check/` 保存不依赖 GUI 交互的验证脚本（bash + MSVC）：
 
-- `wirenet_check.sh`：编译并运行导线几何 / 建网模块的独立单元测试（配合 `stub/wx` 头文件桩，无需链接 wxWidgets）
-- `model_check.sh`：编译并运行模型层冒烟测试（仅依赖 wxBase）
+- `wirenet_check.sh`：编译并运行导线几何 / 建网模块的独立单元测试（依赖 MSVC + 本机 wxWidgets，脚本里的路径需按机器修改）
+- `netlist_check.sh`：网表构建 / 导出测试——走 `stub/wx` 桩 + 任意 g++，不需要 wxWidgets 与 MSVC，可直接运行
+- `model_check.sh`：编译并运行模型层冒烟测试（仅依赖 wxBase，路径需按机器修改）
 - `compile_check.sh` / `link_check.sh`：完整 GUI 程序的编译 / 链接检查
 - `build_exe.sh`：以 Release 配置静态链接 wxWidgets，产出自包含可执行文件 `LogicSim.exe` 并放到桌面
 

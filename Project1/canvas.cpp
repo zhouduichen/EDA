@@ -138,7 +138,12 @@ void CircuitCanvas::SetCircuit(Circuit* c)
     m_wireSticky = false;
     m_wirePrefix.clear();
     m_routed.clear();
-    m_moving = m_movingWire = m_wireBranchPending = m_rubberBanding = m_panning = false;
+    m_moving = m_movingText = m_movingWire = m_wireBranchPending =
+        m_rubberBanding = m_panning = false;
+    m_textMoveSnapshotted = false;
+    m_textMoved = false;
+    m_textDragIndex = -1;
+    m_textMoveOrigins.clear();
     m_dragWireIndex = -1;
     m_undo.clear();
     m_redo.clear();
@@ -153,8 +158,14 @@ void CircuitCanvas::SetCircuit(Circuit* c)
 void CircuitCanvas::SetTool(int tool)
 {
     if (m_drawingWire) CancelWire();
+    if (m_movingText && HasCapture()) ReleaseMouse();
     m_tool = tool;
-    m_moving = m_movingWire = m_wireBranchPending = m_rubberBanding = false;
+    m_moving = m_movingText = m_movingWire = m_wireBranchPending =
+        m_rubberBanding = false;
+    m_textMoveSnapshotted = false;
+    m_textMoved = false;
+    m_textDragIndex = -1;
+    m_textMoveOrigins.clear();
     m_dragWireIndex = -1;
     Refresh();
 }
@@ -351,6 +362,7 @@ void CircuitCanvas::ClearSelection()
 {
     if (!m_circuit) return;
     for (auto& c : m_circuit->comps) c.selected = false;
+    for (auto& t : m_circuit->texts) t.selected = false;
     for (auto& w : m_circuit->wires)
     {
         w.selected = false;
@@ -1187,6 +1199,13 @@ void CircuitCanvas::SelectInRect(const wxRect& r)
     for (auto& c : m_circuit->comps)
         if (rr.Intersects(CompRectPx(c))) c.selected = true;
 
+    for (auto& t : m_circuit->texts)
+    {
+        wxPoint p = ToPx(t.grid);
+        wxSize s = GetTextExtent(t.text);
+        if (rr.Intersects(wxRect(p, s))) t.selected = true;
+    }
+
     for (auto& w : m_circuit->wires)
     {
         for (size_t i = 0; i + 1 < w.points.size(); ++i)
@@ -1353,6 +1372,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
             }
             return;
         }
+        if (m_movingText) { OnTextMoveDrag(e); return; }
         if (m_movingWire) { OnWireMoveDrag(e); return; }
         if (m_draggingEnd) { OnWireEndDrag(e); return; }
         if (m_moving) { OnMoveDrag(e); return; }
@@ -1365,6 +1385,28 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
     }
     if (e.LeftUp())
     {
+        if (m_movingText)
+        {
+            const bool moved = m_textMoved;
+            const int index = m_textDragIndex;
+            m_movingText = false;
+            m_textMoveSnapshotted = false;
+            m_textMoved = false;
+            m_textDragIndex = -1;
+            m_textMoveOrigins.clear();
+            if (HasCapture()) ReleaseMouse();
+
+            if (!moved && m_tool == TOOL_TEXT)
+                EditTextLabel(index);
+            else if (moved)
+                Status(wxT("文本位置已更新，位置已保存"));
+            else
+                Status(wxT("已选中文本：拖动可移动，Delete 删除，双击可编辑"));
+
+            NotifySelectionChanged();
+            Refresh();
+            return;
+        }
         if (m_wireBranchPending)
         {
             // Released without dragging: this was a plain click -> select.
@@ -1516,7 +1558,17 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
         return;
     }
 
-    // 2. A component is selected / moved.
+    // 2. Text is painted above the other objects, so it also receives the
+    // click first.  A press selects and begins a drag; the release without a
+    // drag is handled as a plain selection.
+    const int textIndex = HitText(px);
+    if (textIndex >= 0)
+    {
+        BeginTextDrag(textIndex, e);
+        return;
+    }
+
+    // 3. A component is selected / moved.
     Component* c = HitComponent(px);
     if (c)
     {
@@ -1541,7 +1593,7 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
         return;
     }
 
-    // 3. A wire.
+    // 4. A wire.
     int wireSegment = -1;
     wxPoint wireSnap;
     int wireIndex = HitWire(px, wireSegment, wireSnap);
@@ -1603,7 +1655,7 @@ void CircuitCanvas::OnEditLeftDown(const wxMouseEvent& e)
         return;
     }
 
-    // 4. Empty space: rubber band selection.
+    // 5. Empty space: rubber band selection.
     if (!e.ShiftDown()) ClearSelection();
     NotifySelectionChanged();
     m_rubberBanding = true;
@@ -1643,6 +1695,31 @@ void CircuitCanvas::OnMoveDrag(const wxMouseEvent& e)
     // jogs: the components follow the pointer and every wire is re-laid from
     // its pre-drag geometry.
     RepairWiresForMove(delta);
+    Refresh();
+}
+
+void CircuitCanvas::OnTextMoveDrag(const wxMouseEvent& e)
+{
+    if (!m_circuit || m_textDragIndex < 0) return;
+
+    wxPoint delta = ToGrid(e.GetPosition()) - m_dragStartGrid;
+    if (delta == wxPoint(0, 0)) return;
+
+    if (!m_textMoveSnapshotted)
+    {
+        SnapshotForUndo();
+        m_textMoveSnapshotted = true;
+    }
+    m_textMoved = true;
+
+    size_t i = 0;
+    for (auto& t : m_circuit->texts)
+    {
+        if (!t.selected) continue;
+        if (i < m_textMoveOrigins.size())
+            t.grid = m_textMoveOrigins[i] + delta;
+        ++i;
+    }
     Refresh();
 }
 
@@ -1818,9 +1895,77 @@ void CircuitCanvas::OnPokeClick(const wxMouseEvent& e)
     }
 }
 
+void CircuitCanvas::BeginTextDrag(int index, const wxMouseEvent& e)
+{
+    if (!m_circuit || index < 0 || index >= (int)m_circuit->texts.size()) return;
+
+    TextLabel& text = m_circuit->texts[index];
+    if (e.ShiftDown())
+        text.selected = !text.selected;
+    else if (!text.selected)
+    {
+        ClearSelection();
+        text.selected = true;
+    }
+
+    if (!text.selected)
+    {
+        NotifySelectionChanged();
+        Refresh();
+        return;
+    }
+
+    m_movingText = true;
+    m_textMoveSnapshotted = false;
+    m_textMoved = false;
+    m_textDragIndex = index;
+    m_dragStartPx = e.GetPosition();
+    m_dragStartGrid = ToGrid(e.GetPosition());
+    m_textMoveOrigins.clear();
+    for (const auto& t : m_circuit->texts)
+        if (t.selected) m_textMoveOrigins.push_back(t.grid);
+
+    CaptureMouse();
+    Status(wxT("拖动可移动文本；单击编辑内容；Delete 删除"));
+    NotifySelectionChanged();
+    Refresh();
+}
+
+void CircuitCanvas::EditTextLabel(int index)
+{
+    if (!m_circuit || index < 0 || index >= (int)m_circuit->texts.size()) return;
+
+    TextLabel& text = m_circuit->texts[index];
+    const wxString oldText = text.text;
+    wxString value = wxGetTextFromUser(wxT("文本："), wxT("编辑文本"), oldText, this);
+    if (value.IsEmpty() || value == oldText)
+    {
+        Refresh();
+        return;
+    }
+
+    SnapshotForUndo();
+    text.text = value;
+    text.selected = true;
+    Status(wxT("文本内容已更新"));
+    NotifySelectionChanged();
+    Refresh();
+}
+
 void CircuitCanvas::OnTextClick(const wxMouseEvent& e)
 {
     wxPoint px = e.GetPosition();
+
+    // Existing text has priority over components beneath it.  A single click
+    // selects it and a drag moves it; the button release opens the editor only
+    // when the pointer did not move to another grid cell.
+    const int textIndex = HitText(px);
+    if (textIndex >= 0)
+    {
+        BeginTextDrag(textIndex, e);
+        return;
+    }
+
     Component* c = HitComponent(px);
     if (c)
     {
@@ -1839,10 +1984,18 @@ void CircuitCanvas::OnTextClick(const wxMouseEvent& e)
     if (!s.IsEmpty())
     {
         SnapshotForUndo();
+        ClearSelection();
         TextLabel tl;
+        // Keep the exact grid cell under the click.  The same cell is shown by
+        // the insertion marker while the text tool is active, so the result
+        // no longer appears at an arbitrary nearby position.
         tl.grid = ToGrid(px);
         tl.text = s;
+        tl.selected = true;
         m_circuit->texts.push_back(tl);
+        Status(wxString::Format(wxT("已在 (%d, %d) 添加文本；可拖动、单击编辑或按 Delete 删除"),
+                                tl.grid.x, tl.grid.y));
+        NotifySelectionChanged();
         Refresh();
     }
 }
@@ -1861,6 +2014,23 @@ void CircuitCanvas::OnLeftDClick(wxMouseEvent& e)
         return;
     }
     if (m_drawingWire) return;
+
+    const int textIndex = HitText(e.GetPosition());
+    if (textIndex >= 0)
+    {
+        if (m_movingText)
+        {
+            m_movingText = false;
+            m_textMoveSnapshotted = false;
+            m_textMoved = true;       // suppress the click-to-edit on release
+            m_textDragIndex = -1;
+            m_textMoveOrigins.clear();
+            if (HasCapture()) ReleaseMouse();
+        }
+        if (m_tool == TOOL_EDIT) EditTextLabel(textIndex);
+        return;
+    }
+
     if (m_tool != TOOL_EDIT) return;
     ToggleJunction(e.GetPosition());
 }
@@ -1965,6 +2135,7 @@ void CircuitCanvas::DeleteSelection()
     if (!m_circuit) return;
     bool any = false;
     for (auto& c : m_circuit->comps) if (c.selected) any = true;
+    for (auto& t : m_circuit->texts) if (t.selected) any = true;
     for (auto& w : m_circuit->wires) if (w.selected) any = true;
     if (!any) return;
 
@@ -1997,6 +2168,10 @@ void CircuitCanvas::DeleteSelection()
     comps.erase(std::remove_if(comps.begin(), comps.end(),
         [](const Component& c) { return c.selected; }), comps.end());
 
+    auto& texts = m_circuit->texts;
+    texts.erase(std::remove_if(texts.begin(), texts.end(),
+        [](const TextLabel& t) { return t.selected; }), texts.end());
+
     PruneJunctions();
     DoEvaluate();
     Refresh();
@@ -2007,6 +2182,7 @@ void CircuitCanvas::SelectAll()
 {
     if (!m_circuit) return;
     for (auto& c : m_circuit->comps) c.selected = true;
+    for (auto& t : m_circuit->texts) t.selected = true;
     for (auto& w : m_circuit->wires)
     {
         w.selected = true;
@@ -2367,13 +2543,22 @@ bool CircuitCanvas::ExportImage(const wxString& path)
     int margin = GRID;
     wxPoint saveOffset = m_offset;
     double  saveZoom   = m_zoom;
+    bool    saveHasMouse = m_hasMouse;
 
     // Save and clear the selection so the image is clean.
     std::vector<int> selIds;
     for (auto& c : m_circuit->comps) if (c.selected) { selIds.push_back(c.id); c.selected = false; }
+    std::vector<int> selectedTexts;
+    for (size_t i = 0; i < m_circuit->texts.size(); ++i)
+    {
+        if (!m_circuit->texts[i].selected) continue;
+        selectedTexts.push_back((int)i);
+        m_circuit->texts[i].selected = false;
+    }
 
     m_zoom = 1.0;
     m_offset = wxPoint(-(gb.x - margin) * GRID, -(gb.y - margin) * GRID);
+    m_hasMouse = false;
     int w = (gb.width + 2 * margin) * GRID;
     int h = (gb.height + 2 * margin) * GRID;
 
@@ -2387,7 +2572,11 @@ bool CircuitCanvas::ExportImage(const wxString& path)
 
     m_offset = saveOffset;
     m_zoom = saveZoom;
+    m_hasMouse = saveHasMouse;
     for (int id : selIds) { Component* c = m_circuit->FindComponent(id); if (c) c->selected = true; }
+    for (int index : selectedTexts)
+        if (index >= 0 && index < (int)m_circuit->texts.size())
+            m_circuit->texts[index].selected = true;
     Refresh();
 
     wxImage img = bmp.ConvertToImage();
@@ -2420,6 +2609,32 @@ void CircuitCanvas::DrawScene(wxDC& dc)
     DrawJunctions(dc);
     for (auto& c : m_circuit->comps) DrawComponent(dc, c);
     for (auto& t : m_circuit->texts) DrawTextLabel(dc, t);
+
+    if (m_tool == TOOL_TEXT && m_hasMouse && !m_movingText)
+    {
+        const int hover = HitText(m_curPx);
+        if (hover >= 0)
+        {
+            const TextLabel& t = m_circuit->texts[hover];
+            const wxPoint p = ToPx(t.grid);
+            dc.SetFont(GetFont());
+            const wxSize size = dc.GetTextExtent(t.text);
+            dc.SetPen(wxPen(wxColour(0, 120, 255), 1, wxPENSTYLE_DOT));
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.DrawRectangle(p.x - 3, p.y - 2, size.x + 6, size.y + 4);
+        }
+        else
+        {
+            // The marker and the eventual TEXT record both use ToGrid(px), so
+            // this is the exact anchor where new text will be drawn.
+            const wxPoint anchor = ToPx(ToGrid(m_curPx));
+            dc.SetPen(wxPen(wxColour(0, 120, 255), 2));
+            dc.DrawLine(anchor.x, anchor.y - 4, anchor.x, anchor.y + 16);
+            dc.DrawLine(anchor.x - 3, anchor.y + 16, anchor.x + 3, anchor.y + 16);
+        }
+        dc.SetBrush(wxNullBrush);
+    }
+
     DrawWireSelection(dc);
     DrawPortDots(dc);
 
@@ -2771,9 +2986,17 @@ void CircuitCanvas::DrawComponent(wxDC& dc, const Component& c)
 
 void CircuitCanvas::DrawTextLabel(wxDC& dc, const TextLabel& t)
 {
-    dc.SetTextForeground(wxColour(0, 0, 0));
     dc.SetFont(GetFont());
     wxPoint p = ToPx(t.grid);
+    wxSize size = dc.GetTextExtent(t.text);
+    if (t.selected)
+    {
+        dc.SetPen(wxPen(wxColour(0, 90, 220), 1));
+        dc.SetBrush(wxBrush(wxColour(219, 234, 255)));
+        dc.DrawRectangle(p.x - 3, p.y - 2, size.x + 6, size.y + 4);
+        dc.SetBrush(wxNullBrush);
+    }
+    dc.SetTextForeground(wxColour(0, 0, 0));
     dc.DrawText(t.text, p.x, p.y);
 }
 

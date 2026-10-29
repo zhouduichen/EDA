@@ -556,7 +556,11 @@ bool DeserializeCircuit(const wxString& text, Circuit& c)
                 if (k > 7) comp.label += wxT(" ");
                 comp.label += tok[k];
             }
+            // The GUI clamps the input count to 1..8 (canvas.cpp does the
+            // same when the property changes); a hand-edited file must not
+            // smuggle a gate the rest of the code cannot name or place.
             if (comp.inputs < 1) comp.inputs = 1;
+            if (comp.inputs > 8) comp.inputs = 8;
             comp.RebuildPorts();
             c.comps.push_back(comp);
             continue;

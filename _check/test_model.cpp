@@ -59,6 +59,26 @@ static void LinkProject(std::vector<Circuit>& cs)
     for (auto& c : cs) c.RefreshSubCircuits();
 }
 
+static void TestTextSerialization()
+{
+    Circuit c;
+    TextLabel t;
+    t.grid = wxPoint(12, 7);
+    t.text = wxT("editable text");
+    t.selected = true;
+    c.texts.push_back(t);
+
+    Circuit loaded;
+    Check(DeserializeCircuit(SerializeCircuit(c), loaded), "text circuit loads");
+    Check(loaded.texts.size() == 1, "text survives serialization");
+    Check(!loaded.texts.empty() && loaded.texts[0].grid == wxPoint(12, 7),
+          "text position survives serialization");
+    Check(!loaded.texts.empty() && loaded.texts[0].text == wxT("editable text"),
+          "text content survives serialization");
+    Check(!loaded.texts.empty() && !loaded.texts[0].selected,
+          "runtime text selection is not serialized");
+}
+
 
 // ---------------------------------------------------------------------------
 // Sub-circuits: a circuit used as a component.
@@ -1054,6 +1074,7 @@ int main()
     TestSubCircuitPinLayout();
     TestSubCircuitEval();
     TestCrossingEval();
+    TestTextSerialization();
 
     printf("\n%s\n", g_fail ? "SOME CHECKS FAILED" : "all checks passed");
     return g_fail ? 1 : 0;

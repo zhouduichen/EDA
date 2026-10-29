@@ -82,6 +82,7 @@ struct TextLabel
 {
     wxPoint  grid;
     wxString text;
+    bool     selected = false;   // runtime only (not serialized)
 };
 
 // Logisim model: one Wire is ONE horizontal or vertical segment (two end
