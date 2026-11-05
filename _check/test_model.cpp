@@ -981,6 +981,127 @@ static void TestSubCircuitEval()
     }
 }
 
+static void TestClipboard()
+{
+    printf("\n-- clipboard construction --\n");
+
+    // Reported bug: after Ctrl+C / Ctrl+V every vertical segment disappeared.
+    // A trunk between two branches has -1 at BOTH ends, so a filter that only
+    // looked at srcComp/dstComp silently dropped it.
+    Circuit c;
+    const int pin  = AddComp(c, CT_PinIn,  0, 0);      // port (2,1)
+    const int orG  = AddComp(c, CT_Or,     8, 0);      // out  (12,2)
+    const int norG = AddComp(c, CT_Nor,    8, 6);      // out  (13,8)
+    const int out1 = AddComp(c, CT_PinOut, 16, 1);     // port (16,2)
+    const int out2 = AddComp(c, CT_PinOut, 16, 7);     // port (16,8)
+
+    AddSeg(c, wxPoint(2, 1),  wxPoint(6, 1),  pin, 0);
+    AddSeg(c, wxPoint(6, 1),  wxPoint(6, 7));                       // trunk: -1 / -1
+    AddSeg(c, wxPoint(6, 1),  wxPoint(8, 1),  -1, -1, orG, 0);
+    AddSeg(c, wxPoint(6, 7),  wxPoint(8, 7),  -1, -1, norG, 0);
+    AddSeg(c, wxPoint(12, 2), wxPoint(16, 2), orG, 2, out1, 0);
+    AddSeg(c, wxPoint(13, 8), wxPoint(16, 8), norG, 2, out2, 0);
+
+    TextLabel tl;
+    tl.grid = wxPoint(4, 4);
+    tl.text = wxT("note");
+    tl.selected = true;
+    c.texts.push_back(tl);
+    c.junctions.push_back(wxPoint(6, 1));     // sits on the trunk
+    c.junctions.push_back(wxPoint(30, 30));   // unrelated
+
+    auto HasSegment = [](const Circuit& x, wxPoint a, wxPoint b)
+    {
+        for (const Wire& w : x.wires)
+            if (w.points.size() == 2 &&
+                ((w.points[0] == a && w.points[1] == b) ||
+                 (w.points[0] == b && w.points[1] == a))) return true;
+        return false;
+    };
+    auto SelectAll = [](Circuit& x, bool wiresToo)
+    {
+        for (Component& comp : x.comps) comp.selected = true;
+        for (TextLabel&  t   : x.texts) t.selected = true;
+        for (Wire&       w   : x.wires) w.selected = wiresToo;
+    };
+
+    // Case 1: Ctrl+A -- every wire explicitly selected.
+    SelectAll(c, true);
+    Circuit clip;
+    Check(BuildClipboardCircuit(c, clip) == 12, "full selection copies 5 comps + 6 wires + 1 text");
+    Check(clip.wires.size() == 6, "full selection keeps all six wire segments");
+    Check(HasSegment(clip, wxPoint(6, 1), wxPoint(6, 7)), "vertical trunk is in the clipboard");
+    Check(clip.texts.size() == 1, "selected text label is copied");
+    Check(clip.junctions.size() == 1 && clip.junctions[0] == wxPoint(6, 1),
+          "only junctions on copied wires are kept");
+
+    // Round trip through the exact format Copy/Paste uses.
+    const wxString blob = SerializeCircuit(clip);
+    Circuit restored;
+    Check(DeserializeCircuit(blob, restored), "clipboard blob deserializes");
+    Check(restored.wires.size() == 6, "all six segments survive paste data");
+    Check(HasSegment(restored, wxPoint(6, 1), wxPoint(6, 7)), "vertical trunk survives paste data");
+
+    // Electrical check: the pin drives the lower gate through that trunk.
+    for (Component& comp : restored.comps)
+        if (comp.type == CT_PinIn) comp.value = 1;
+    EvaluateCircuit(restored);
+    bool lowerInputDriven = false;
+    for (Component& comp : restored.comps)
+        if (comp.type == CT_Nor && !comp.ports.empty() &&
+            comp.ports[0].value == LV_One) lowerInputDriven = true;
+    Check(lowerInputDriven, "lower gate input is driven through the vertical trunk");
+
+    // Case 2: only components selected (clicked one by one, no Ctrl+A).
+    // The closure must still find the free-ended trunk and branches.
+    SelectAll(c, false);
+    Circuit clip2;
+    Check(BuildClipboardCircuit(c, clip2) > 0, "component-only selection copies something");
+    Check(clip2.wires.size() == 6, "closure brings in the free-ended trunk and branches");
+    Check(HasSegment(clip2, wxPoint(6, 1), wxPoint(6, 7)), "component-only selection keeps the trunk");
+
+    // Case 3: a wire anchored to a component OUTSIDE the selection must not
+    // be dragged in by the closure.
+    Circuit c3;
+    const int a1  = AddComp(c3, CT_PinIn,  0, 0);
+    const int a2  = AddComp(c3, CT_PinOut, 12, 0);
+    const int far = AddComp(c3, CT_PinOut, 20, 0);
+    AddSeg(c3, wxPoint(2, 1),  wxPoint(6, 1),  a1, 0);
+    AddSeg(c3, wxPoint(6, 1),  wxPoint(12, 1), -1, -1, a2, 0);
+    AddSeg(c3, wxPoint(12, 1), wxPoint(20, 1), -1, -1, far, 0);
+    for (Component& comp : c3.comps) comp.selected = (comp.id == a1 || comp.id == a2);
+    for (Wire& w : c3.wires) w.selected = false;
+    Circuit clip3;
+    BuildClipboardCircuit(c3, clip3);
+    Check(clip3.wires.size() == 2, "closure does not pull in wires anchored outside");
+    Check(!HasSegment(clip3, wxPoint(12, 1), wxPoint(20, 1)), "outside-anchored wire is excluded");
+
+    // Case 4: nothing selected.
+    Circuit c4 = c;
+    for (Component& comp : c4.comps) comp.selected = false;
+    for (Wire& w : c4.wires) w.selected = false;
+    for (TextLabel& t : c4.texts) t.selected = false;
+    Circuit clip4;
+    Check(BuildClipboardCircuit(c4, clip4) == 0, "empty selection copies nothing");
+
+    // Regression guard: the old CopySelection() kept a wire only when one of
+    // its ends named a copied component.  Simulate that rule here and confirm
+    // it really loses a segment, so the cases above are not vacuously true.
+    int legacyKept = 0;
+    bool legacyHasTrunk = false;
+    for (const Wire& w : c.wires)
+    {
+        if (w.srcComp < 0 && w.dstComp < 0) continue;
+        ++legacyKept;
+        if (w.points.size() == 2 &&
+            ((w.points[0] == wxPoint(6, 1) && w.points[1] == wxPoint(6, 7)) ||
+             (w.points[1] == wxPoint(6, 1) && w.points[0] == wxPoint(6, 7))))
+            legacyHasTrunk = true;
+    }
+    Check(legacyKept == 5 && !legacyHasTrunk,
+          "regression guard: old endpoint-only filter loses the trunk");
+}
+
 int main()
 {
     // Unbuffered so a hang localizes to the last printed check.  Assertions go
@@ -1075,6 +1196,7 @@ int main()
     TestSubCircuitEval();
     TestCrossingEval();
     TestTextSerialization();
+    TestClipboard();
 
     printf("\n%s\n", g_fail ? "SOME CHECKS FAILED" : "all checks passed");
     return g_fail ? 1 : 0;

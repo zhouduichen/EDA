@@ -263,6 +263,13 @@ void EvaluateCircuit(Circuit& c, const std::vector<Circuit>* project = nullptr, 
 wxString SerializeCircuit(const Circuit& c);
 bool DeserializeCircuit(const wxString& text, Circuit& c);
 
+// Collect the selected objects into a self-contained circuit ready to be
+// serialized into the clipboard.  Component ids are renumbered from 1, wire
+// ends that point outside the clipboard become free (-1), and interior wire
+// segments between copied objects are pulled in as well.  Returns the number
+// of copied objects; 0 means nothing was selected.
+int BuildClipboardCircuit(const Circuit& src, Circuit& dst);
+
 // Whole-project files (all circuits, so sub-circuit definitions survive).
 // A file written by an older version (a single circuit) still loads.
 // Delete every instance of the circuit called `name` from the whole project,

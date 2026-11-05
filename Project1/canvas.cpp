@@ -2263,31 +2263,7 @@ void CircuitCanvas::CopySelection()
 {
     if (!m_circuit) return;
     Circuit tmp;
-    tmp.name = wxT("clipboard");
-    std::map<int, int> idmap;
-    int next = 1;
-    for (auto& c : m_circuit->comps)
-    {
-        if (!c.selected) continue;
-        Component n = c;
-        n.id = next++;
-        idmap[c.id] = n.id;
-        tmp.comps.push_back(n);
-    }
-    for (auto& w : m_circuit->wires)
-    {
-        if (idmap.count(w.srcComp) || idmap.count(w.dstComp))
-        {
-            Wire nw = w;
-            nw.srcComp = idmap.count(w.srcComp) ? idmap[w.srcComp] : -1;
-            nw.srcPort = nw.srcComp >= 0 ? w.srcPort : -1;
-            nw.dstComp = idmap.count(w.dstComp) ? idmap[w.dstComp] : -1;
-            nw.dstPort = nw.dstComp >= 0 ? w.dstPort : -1;
-            tmp.wires.push_back(nw);
-        }
-    }
-    tmp.nextId = next;
-    if (tmp.comps.empty())
+    if (BuildClipboardCircuit(*m_circuit, tmp) == 0)
     {
         Status(wxT("没有可复制的选中对象"));
         return;
@@ -2307,7 +2283,8 @@ void CircuitCanvas::PasteSelection()
 {
     if (m_clipboard.IsEmpty() || !m_circuit) return;
     Circuit tmp;
-    if (!DeserializeCircuit(m_clipboard, tmp) || tmp.comps.empty()) return;
+    if (!DeserializeCircuit(m_clipboard, tmp)) return;
+    if (tmp.comps.empty() && tmp.wires.empty() && tmp.texts.empty()) return;
 
     SnapshotForUndo();
     m_clipOffset += 2;
@@ -2334,14 +2311,24 @@ void CircuitCanvas::PasteSelection()
         w.group = wireGroups[w.group];
         for (auto& p : w.points) p += wxPoint(m_clipOffset, m_clipOffset);
     }
+    for (auto& t : tmp.texts)
+    {
+        t.grid += wxPoint(m_clipOffset, m_clipOffset);
+        t.selected = true;
+    }
+    for (auto& jp : tmp.junctions)
+        jp += wxPoint(m_clipOffset, m_clipOffset);
 
     for (auto& c : m_circuit->comps) c.selected = false;
+    for (auto& w : m_circuit->wires) w.selected = false;
     for (auto& c : tmp.comps)
     {
         m_circuit->comps.push_back(c);
         m_circuit->comps.back().selected = true;
     }
     for (auto& w : tmp.wires) m_circuit->wires.push_back(w);
+    for (auto& t : tmp.texts) m_circuit->texts.push_back(t);
+    for (auto& jp : tmp.junctions) m_circuit->junctions.push_back(jp);
 
     m_circuit->RefreshWireEndpoints();
     DoEvaluate();

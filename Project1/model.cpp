@@ -6,6 +6,133 @@
 #include "wirenet.h"
 #include <wx/tokenzr.h>
 #include <algorithm>
+#include <map>
+
+// ---------------------------------------------------------------------------
+// Clipboard construction (pure data, so it can be unit tested without a GUI)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    bool PointOnOrthoSegment(const wxPoint& p, const wxPoint& a, const wxPoint& b)
+    {
+        if (a.x == b.x)
+            return p.x == a.x &&
+                   p.y >= std::min(a.y, b.y) && p.y <= std::max(a.y, b.y);
+        if (a.y == b.y)
+            return p.y == a.y &&
+                   p.x >= std::min(a.x, b.x) && p.x <= std::max(a.x, b.x);
+        return false;
+    }
+}
+
+int BuildClipboardCircuit(const Circuit& src, Circuit& dst)
+{
+    dst.Clear();
+    dst.name = wxT("clipboard");
+
+    std::map<int, int> idmap;
+    int next = 1;
+    for (const Component& c : src.comps)
+    {
+        if (!c.selected) continue;
+        Component n = c;
+        n.id = next++;
+        n.selected = false;
+        idmap[c.id] = n.id;
+        dst.comps.push_back(n);
+    }
+
+    auto touchesCopied = [&](const Wire& w)
+    {
+        return (w.srcComp >= 0 && idmap.count(w.srcComp) != 0) ||
+               (w.dstComp >= 0 && idmap.count(w.dstComp) != 0);
+    };
+    auto anchoredOutside = [&](const Wire& w)
+    {
+        return (w.srcComp >= 0 && idmap.count(w.srcComp) == 0) ||
+               (w.dstComp >= 0 && idmap.count(w.dstComp) == 0);
+    };
+
+    std::vector<bool> take(src.wires.size(), false);
+    for (size_t i = 0; i < src.wires.size(); ++i)
+        if (src.wires[i].selected || touchesCopied(src.wires[i]))
+            take[i] = true;
+
+    // A vertical trunk / T branch has -1 at BOTH ends: it joins other wires,
+    // never a component port.  Filtering on srcComp/dstComp alone used to drop
+    // every one of those segments, so a pasted circuit kept its horizontal
+    // leads but came apart vertically.  Grow the selection through free-ended
+    // wires that share an endpoint with a wire already taken.  Wires anchored
+    // to a component outside the clipboard are deliberately left behind.
+    bool grew = true;
+    while (grew)
+    {
+        grew = false;
+        std::vector<wxPoint> ends;
+        for (size_t i = 0; i < src.wires.size(); ++i)
+        {
+            if (!take[i] || src.wires[i].points.size() < 2) continue;
+            ends.push_back(src.wires[i].points.front());
+            ends.push_back(src.wires[i].points.back());
+        }
+        for (size_t i = 0; i < src.wires.size(); ++i)
+        {
+            if (take[i] || src.wires[i].points.size() < 2) continue;
+            if (anchoredOutside(src.wires[i])) continue;
+            const Wire& w = src.wires[i];
+            for (const wxPoint& e : ends)
+            {
+                if (w.points.front() == e || w.points.back() == e)
+                {
+                    take[i] = true;
+                    grew = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < src.wires.size(); ++i)
+    {
+        if (!take[i]) continue;
+        Wire nw = src.wires[i];
+        nw.srcComp = idmap.count(nw.srcComp) ? idmap[nw.srcComp] : -1;
+        nw.srcPort = nw.srcComp >= 0 ? nw.srcPort : -1;
+        nw.dstComp = idmap.count(nw.dstComp) ? idmap[nw.dstComp] : -1;
+        nw.dstPort = nw.dstComp >= 0 ? nw.dstPort : -1;
+        nw.selected = false;
+        nw.selectedSegment = -1;
+        nw.value = LV_Unknown;
+        dst.wires.push_back(nw);
+    }
+
+    for (const TextLabel& t : src.texts)
+    {
+        if (!t.selected) continue;
+        TextLabel n = t;
+        n.selected = false;
+        dst.texts.push_back(n);
+    }
+
+    for (const wxPoint& jp : src.junctions)
+    {
+        bool onCopiedWire = false;
+        for (const Wire& w : dst.wires)
+        {
+            for (size_t k = 0; k + 1 < w.points.size() && !onCopiedWire; ++k)
+                if (PointOnOrthoSegment(jp, w.points[k], w.points[k + 1]))
+                    onCopiedWire = true;
+            if (onCopiedWire) break;
+        }
+        if (onCopiedWire) dst.junctions.push_back(jp);
+    }
+
+    dst.nextId = next;
+    dst.LinkComponents();
+    return (int)(dst.comps.size() + dst.wires.size() + dst.texts.size());
+}
+
 
 wxString TypeName(ComponentType t)
 {
