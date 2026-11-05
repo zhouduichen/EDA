@@ -4,6 +4,7 @@
 
 #include "canvas.h"
 #include "wirenet.h"
+#include "keybindings.h"
 
 #include <wx/dcbuffer.h>
 #include <wx/dcmemory.h>
@@ -1409,7 +1410,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
             else if (moved)
                 Status(wxT("文本位置已更新，位置已保存"));
             else
-                Status(wxT("已选中文本：拖动可移动，Delete 删除，双击可编辑"));
+                Status(wxT("已选中文本：拖动可移动，Delete / Backspace 删除，双击可编辑"));
 
             NotifySelectionChanged();
             Refresh();
@@ -1435,7 +1436,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
                 }
                 w.selectedSegment = -1;
                 if (w.selected)
-                    Status(wxT("已选中导线段：再次按下并拖动可移动，Delete 删除"));
+                    Status(wxT("已选中导线段：再次按下并拖动可移动，Delete / Backspace 删除"));
             }
             NotifySelectionChanged();
             Refresh();
@@ -1486,7 +1487,7 @@ void CircuitCanvas::OnMouse(wxMouseEvent& e)
                 if (m_endWireIndex >= 0 && m_endWireIndex < (int)m_circuit->wires.size())
                 {
                     m_circuit->wires[m_endWireIndex].selected = true;
-                    Status(wxT("已选中导线段：再次按下并拖动可移动，Delete 删除"));
+                    Status(wxT("已选中导线段：再次按下并拖动可移动，Delete / Backspace 删除"));
                 }
             }
             else
@@ -1937,7 +1938,7 @@ void CircuitCanvas::BeginTextDrag(int index, const wxMouseEvent& e)
         if (t.selected) m_textMoveOrigins.push_back(t.grid);
 
     CaptureMouse();
-    Status(wxT("拖动可移动文本；单击编辑内容；Delete 删除"));
+    Status(wxT("拖动可移动文本；单击编辑内容；Delete / Backspace 删除"));
     NotifySelectionChanged();
     Refresh();
 }
@@ -2004,7 +2005,7 @@ void CircuitCanvas::OnTextClick(const wxMouseEvent& e)
         tl.text = s;
         tl.selected = true;
         m_circuit->texts.push_back(tl);
-        Status(wxString::Format(wxT("已在 (%d, %d) 添加文本；可拖动、单击编辑或按 Delete 删除"),
+        Status(wxString::Format(wxT("已在 (%d, %d) 添加文本；可拖动、单击编辑或按 Delete / Backspace 删除"),
                                 tl.grid.x, tl.grid.y));
         NotifySelectionChanged();
         Refresh();
@@ -2115,7 +2116,10 @@ void CircuitCanvas::OnKey(wxKeyEvent& e)
     if (ctrl && k == 'V') { PasteSelection(); return; }
     if (ctrl && k == 'A') { SelectAll(); return; }
 
-    if (k == WXK_DELETE || k == WXK_NUMPAD_DELETE) { DeleteSelection(); return; }
+    // Backspace is an alias for Delete (see keybindings.h).  This handler is
+    // bound to both KEY_DOWN and CHAR; DeleteSelection() is idempotent, so a
+    // repeated delivery cannot remove anything twice.
+    if (eda::IsDeleteKey(k)) { DeleteSelection(); return; }
 
     if (k == WXK_ESCAPE)
     {

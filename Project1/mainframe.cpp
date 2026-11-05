@@ -419,7 +419,7 @@ void MainFrame::SetCurrentTool(int tool)
     {
         case TOOL_EDIT:   Status(wxT("编辑工具：选择、移动元件并绘制导线")); break;
         case TOOL_POKE:   Status(wxT("电平工具：单击输入引脚切换其电平")); break;
-        case TOOL_TEXT:   Status(wxT("文本工具：单击空白处添加；单击文本编辑；拖动文本移动；Delete 删除")); break;
+        case TOOL_TEXT:   Status(wxT("文本工具：单击空白处添加；单击文本编辑；拖动文本移动；Delete / Backspace 删除")); break;
         default:          Status(wxT("放置") + TypeName(TypeForToolComponent(tool)) + wxT("：单击画布放置")); break;
     }
 }
