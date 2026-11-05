@@ -1212,8 +1212,16 @@ void CircuitCanvas::SelectInRect(const wxRect& r)
         {
             wxPoint a = ToPx(w.points[i]);
             wxPoint b = ToPx(w.points[i + 1]);
+            // Every wire is axis aligned, so its bounding rect has a zero
+            // width (vertical run) or a zero height (horizontal run).  Such a
+            // rect never registers an overlap: wxRect::Intersect() collapses
+            // both dimensions to zero as soon as one of them is not positive,
+            // and Intersects() then reports "no".  That is why a rubber band
+            // used to skip every wire, so a select-all delete removed the runs
+            // that died with their ports and left the vertical middle
+            // segments behind.  Give the segment a one pixel extent instead.
             wxRect seg(std::min(a.x, b.x), std::min(a.y, b.y),
-                       std::abs(b.x - a.x), std::abs(b.y - a.y));
+                       std::abs(b.x - a.x) + 1, std::abs(b.y - a.y) + 1);
             if (rr.Intersects(seg))
             {
                 w.selected = true;
@@ -1878,8 +1886,11 @@ void CircuitCanvas::OnPlaceClick(const wxPoint& grid)
     SnapshotForUndo();
     PlaceComponent(t, grid);
     DoEvaluate();
-    SetTool(TOOL_EDIT);
-    Status(wxT("已放置 ") + TypeName(t) + wxT("，已返回编辑模式"));
+    // Stay in the placement tool: drawing a run of gates should not force a
+    // trip back to the palette for every single one.  Right click or Esc is
+    // the way out, as it already was for the wiring tool.
+    Status(wxT("已放置 ") + TypeName(t) + wxT("（可继续单击放置，右键或 Esc 返回编辑）"));
+    Refresh();
 }
 
 void CircuitCanvas::OnPokeClick(const wxMouseEvent& e)

@@ -59,7 +59,7 @@ msbuild Project1.slnx /p:Configuration=Release /p:Platform=x64
 | 文件 | 职责 |
 | --- | --- |
 | `eda.h` / `eda.cpp` / `noname.h` | wxFormBuilder 生成的 GUI 框架（菜单栏、工具栏、左侧面板、属性网格），**不手工修改** |
-| `mainframe.h` / `mainframe.cpp` | `MainFrame`：把编辑内核挂到生成框架的各个控件上（画布、元件树、工具栏、菜单、属性表、左侧按钮）；管理多电路工程、会话保存、文件打开 / 保存 / 导出、电路统计 |
+| `mainframe.h` / `mainframe.cpp` | `MainFrame`：把编辑内核挂到生成框架的各个控件上（画布、元件树、工具栏、菜单、属性表；生成器留下的两排空按钮已在运行时隐藏）；管理多电路工程、会话保存、文件打开 / 保存 / 导出、电路统计 |
 | `model.h` / `model.cpp` | 与 GUI 无关的数据模型：`Circuit` / `Component` / `Wire` / `Port`、20 像素网格、组合逻辑求值（含子电路展开）、工程序列化 |
 | `canvas.h` / `canvas.cpp` | `CircuitCanvas`：绘制与全部鼠标 / 键盘交互——工具、走线、选中、移动修复、撤销重做、缩放、PNG 导出 |
 | `wirenet.h` / `wirenet.cpp` | 正交导线几何与电气网络提取：连接规则、最短正交走线、避障布线、WireRepair 位移重铺。只认识网格点与折线，不依赖 wxString / wxDC，可独立测试 |
