@@ -48,6 +48,44 @@ namespace
         return nullptr;
     }
 
+    // The generated resource is deliberately never edited (see noname.h), so
+    // placeholder menu entries are pruned here at runtime, before BindMenu()
+    // walks the surviving items.  Labels are matched without the accelerator
+    // suffix, exactly like MenuLabel().
+    void PruneMenu(wxMenu* menu, const wxChar* const* dead, size_t count)
+    {
+        if (!menu) return;
+        for (size_t k = 0; k < count; ++k)
+        {
+            wxMenuItem* mi = FindByLabel(menu, dead[k]);
+            if (mi) menu->Delete(mi);
+        }
+
+        // Removing a whole group leaves orphaned separators: collapse runs,
+        // drop a leading one, and drop a trailing one.
+        bool prevSep = true;
+        for (size_t i = 0; i < menu->GetMenuItemCount(); )
+        {
+            wxMenuItem* mi = menu->FindItemByPosition(i);
+            const bool sep = mi && mi->IsSeparator();
+            if (sep && prevSep) { menu->Delete(mi); continue; }
+            prevSep = sep;
+            ++i;
+        }
+        const size_t n = menu->GetMenuItemCount();
+        if (n > 0)
+        {
+            wxMenuItem* last = menu->FindItemByPosition(n - 1);
+            if (last && last->IsSeparator()) menu->Delete(last);
+        }
+    }
+
+    template <size_t N>
+    void PruneMenu(wxMenu* menu, const wxChar* const (&dead)[N])
+    {
+        PruneMenu(menu, dead, N);
+    }
+
     // Generate a simple 16x16 icon for a toolbar tool.  The generated framework
     // adds the tools with wxNullBitmap, which wxMSW rejects once wxTB_TEXT is on,
     // so every tool needs a real bitmap.
@@ -353,12 +391,52 @@ void MainFrame::SetupMenus()
                      wxT("导出 KiCad 格式网表，可被 PCB 软件加载"));
     }
 
+    // Placeholder entries: each of these only printed a status line (a
+    // not-implemented notice or a no-op confirmation) and had no behaviour
+    // behind it.  Kept as data because a typo here would silently leave a
+    // dead item on screen; _check/menu_check.py verifies every label against
+    // eda.cpp.
+    static const wxChar* const kFileDead[] = {
+        wxT("最近打开"), wxT("打印"), wxT("首选项...")
+    };
+    static const wxChar* const kEditDead[] = {
+        wxT("上移一层"), wxT("下移一层"), wxT("置于顶层"), wxT("置于底层")
+    };
+    static const wxChar* const kProjectDead[] = {
+        wxT("加载库"), wxT("卸载库..."), wxT("恢复默认外观"), wxT("查看仿真树"),
+        wxT("编辑电路布局"), wxT("编辑电路外观"), wxT("分析电路"), wxT("选项...")
+    };
+    static const wxChar* const kSimulateDead[] = {
+        wxT("启用时钟"), wxT("日志...")
+    };
+    static const wxChar* const kWindowDead[] = {
+        wxT("组合逻辑分析"), wxT("首选项"), wxT("未命名")
+    };
+
+    PruneMenu(File,     kFileDead);
+    PruneMenu(Edit,     kEditDead);
+    PruneMenu(Project,  kProjectDead);
+    PruneMenu(Simulate, kSimulateDead);
+    PruneMenu(Window,   kWindowDead);
+
+    // "帮助" and all of its children (教程 / 用户指南 / 元件库参考 / 关于...)
+    // go away wholesale.  wxMenuBar::Remove hands ownership back to us;
+    // MyFrame2's destructor is empty, so nothing else will free it.
+    if (m_menubar2)
+    {
+        const int helpPos = m_menubar2->FindMenu(wxT("帮助"));
+        if (helpPos != wxNOT_FOUND)
+        {
+            delete m_menubar2->Remove((size_t)helpPos);
+            Help = nullptr;
+        }
+    }
+
     BindMenu(File,     &MainFrame::OnMenuFile);
     BindMenu(Edit,     &MainFrame::OnMenuEdit);
     BindMenu(Project,  &MainFrame::OnMenuProject);
     BindMenu(Simulate, &MainFrame::OnMenuSimulate);
     BindMenu(Window,   &MainFrame::OnMenuWindow);
-    BindMenu(Help,     &MainFrame::OnMenuHelp);
 }
 
 void MainFrame::BindMenu(wxMenu* menu, void (MainFrame::*handler)(wxCommandEvent&))
@@ -377,7 +455,7 @@ void MainFrame::BindMenu(wxMenu* menu, void (MainFrame::*handler)(wxCommandEvent
 // band: nothing to look at, nothing to click, yet their sizer is given half of
 // the panel height and pushes the circuit tree down.  Every action they carry
 // is also on the Project menu (添加电路 / 上移电路 / 下移电路 / 移除电路 /
-// 查看仿真树 ...), so hide them and strip the sizer weight.  Both steps are
+// 查看工具箱 ...), so hide them and strip the sizer weight.  Both steps are
 // done here rather than in eda.cpp, which is generated and must stay untouched:
 // re-running wxFormBuilder then cannot bring the blank band back.  To restore
 // the buttons, delete this body and rebind them.
@@ -737,14 +815,11 @@ void MainFrame::OnMenuFile(wxCommandEvent& e)
 
     if (label == wxT("新建"))                   DoNew();
     else if (label == wxT("打开"))             DoOpen();
-    else if (label == wxT("最近打开"))         Status(wxT("没有最近打开的文件"));
     else if (label == wxT("关闭"))             DoNew();
     else if (label == wxT("保存"))             DoSave(false);
     else if (label == wxT("另存为"))           DoSave(true);
     else if (label == wxT("导出图像"))         DoExportImage();
     else if (label == wxT("导出网表"))         DoExportNetlist();
-    else if (label == wxT("打印"))             Status(wxT("打印功能尚未实现"));
-    else if (label == wxT("首选项..."))        Status(wxT("首选项功能尚未实现"));
     else if (label == wxT("退出"))             Close(true);
 }
 
@@ -761,10 +836,6 @@ void MainFrame::OnMenuEdit(wxCommandEvent& e)
     else if (label == wxT("全选"))                  m_canvas->SelectAll();
     else if (label == wxT("添加拐点"))              m_canvas->AddVertexToSelectedWire();
     else if (label == wxT("删除拐点"))              m_canvas->RemoveVertexFromSelectedWire();
-    else if (label == wxT("上移一层"))              Status(wxT("上移一层功能尚未实现"));
-    else if (label == wxT("下移一层"))              Status(wxT("下移一层功能尚未实现"));
-    else if (label == wxT("置于顶层"))              Status(wxT("置于顶层功能尚未实现"));
-    else if (label == wxT("置于底层"))              Status(wxT("置于底层功能尚未实现"));
 }
 
 void MainFrame::OnMenuProject(wxCommandEvent& e)
@@ -777,10 +848,7 @@ void MainFrame::OnMenuProject(wxCommandEvent& e)
     else if (label == wxT("设为主电路"))          SwitchCircuit(0);
     else if (label == wxT("移除电路"))            RemoveCircuit();
     else if (label == wxT("查看工具箱"))          m_treeCtrl1->ExpandAll();
-    else if (label == wxT("查看仿真树"))          Status(wxT("仿真树"));
     else if (label == wxT("电路统计"))            DoStatistics();
-    else if (label == wxT("恢复默认外观"))        Status(wxT("已恢复默认外观"));
-    else Status(label + wxT("（尚未实现）"));
 }
 
 void MainFrame::DoStatistics()
@@ -814,8 +882,6 @@ void MainFrame::OnMenuSimulate(wxCommandEvent& e)
     else if (label == wxT("重置仿真"))           m_canvas->ResetSimulation();
     else if (label == wxT("单步仿真"))           m_canvas->StepSimulation();
     else if (label == wxT("单步执行"))           m_canvas->StepSimulation();
-    else if (label == wxT("启用时钟"))           Status(wxT("组合逻辑电路不需要时钟"));
-    else if (label == wxT("日志..."))            Status(wxT("日志功能尚未实现"));
 }
 
 void MainFrame::OnMenuWindow(wxCommandEvent& e)
@@ -825,24 +891,6 @@ void MainFrame::OnMenuWindow(wxCommandEvent& e)
     if (label == wxT("最小化"))                  Iconize(true);
     else if (label == wxT("最大化"))             Maximize(true);
     else if (label == wxT("关闭"))               Close(true);
-    else if (label == wxT("组合逻辑分析"))       Status(wxT("组合逻辑分析尚未实现"));
-    else if (label == wxT("首选项"))             Status(wxT("首选项功能尚未实现"));
-    else Status(label);
-}
-
-void MainFrame::OnMenuHelp(wxCommandEvent& e)
-{
-    wxString label = MenuLabel(Help, e.GetId());
-
-    if (label == wxT("关于..."))
-    {
-        wxMessageBox(
-            wxT("数字逻辑电路绘图与仿真软件\n\n")
-            wxT("基于 wxWidgets 开发的轻量数字逻辑电路编辑器。\n")
-            wxT("可从左侧放置逻辑门，连接导线并运行仿真。"),
-            wxT("关于"), wxOK | wxICON_INFORMATION);
-    }
-    else Status(label + wxT("（尚未实现）"));
 }
 
 void MainFrame::OnPropertyChanged(wxPropertyGridEvent& e)

@@ -68,7 +68,6 @@ private:
     void OnMenuProject(wxCommandEvent& e);
     void OnMenuSimulate(wxCommandEvent& e);
     void OnMenuWindow(wxCommandEvent& e);
-    void OnMenuHelp(wxCommandEvent& e);
     void OnPropertyChanged(wxPropertyGridEvent& e);
     void OnSpin(wxSpinEvent& e);
 
