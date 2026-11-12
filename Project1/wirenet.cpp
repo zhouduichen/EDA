@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <queue>
@@ -778,6 +779,453 @@ std::vector<wnNet> wnBuildNets(const std::vector<std::vector<wxPoint>>& polys,
     }
 
     return nets;
+}
+
+std::vector<std::vector<int>> wnPortGroups(
+    const std::vector<std::vector<wxPoint>>& polys,
+    const std::vector<wxPoint>& portPos,
+    const std::vector<wxPoint>& junctionPos)
+{
+    std::vector<std::vector<int>> groups;
+    const std::vector<wnNet> nets = wnBuildNets(polys, portPos, junctionPos);
+    for (const wnNet& net : nets)
+    {
+        if (net.ports.empty()) continue;
+        std::vector<int> g = net.ports;
+        std::sort(g.begin(), g.end());
+        g.erase(std::unique(g.begin(), g.end()), g.end());
+        groups.push_back(g);
+    }
+    std::sort(groups.begin(), groups.end());
+    return groups;
+}
+
+int wnJunctionCount(const std::vector<std::vector<wxPoint>>& polys,
+                    const std::vector<wxPoint>& junctionPos)
+{
+    const std::vector<wnNet> nets = wnBuildNets(polys, std::vector<wxPoint>(),
+                                                junctionPos);
+    std::vector<wxPoint> dots;
+    for (const wnNet& net : nets)
+    {
+        for (const wxPoint& p : net.junctions)
+        {
+            bool known = false;
+            for (const wxPoint& q : dots) if (q == p) { known = true; break; }
+            if (!known) dots.push_back(p);
+        }
+    }
+    // Explicit marks the user placed are painted too, as long as a wire still
+    // runs through them (DrawJunctions applies the same rule).
+    for (const wxPoint& p : junctionPos)
+    {
+        if (!wnOnWires(polys, p)) continue;
+        bool known = false;
+        for (const wxPoint& q : dots) if (q == p) { known = true; break; }
+        if (!known) dots.push_back(p);
+    }
+    return (int)dots.size();
+}
+
+namespace
+{
+    // Remove zero-length legs and monotone collinear vertices, but KEEP a
+    // collinear reversal (a spur another wire branches off).  wnNormalize is
+    // too aggressive here: on one real circuit it deleted the (9,3) spur and
+    // disconnected the branch hanging off it.
+    void CleanRun(std::vector<wxPoint>& v)
+    {
+        std::vector<wxPoint> t;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (t.empty() || !(t.back() == v[i])) t.push_back(v[i]);
+        v.swap(t);
+
+        bool again = true;
+        while (again)
+        {
+            again = false;
+            for (size_t i = 1; i + 1 < v.size() && !again; ++i)
+            {
+                if (v[i-1].x != v[i].x && v[i-1].y != v[i].y) continue;
+                if (v[i].x   != v[i+1].x && v[i].y != v[i+1].y) continue;
+                const bool line =
+                    (v[i-1].x == v[i].x && v[i].x == v[i+1].x) ||
+                    (v[i-1].y == v[i].y && v[i].y == v[i+1].y);
+                if (!line) continue;
+                const int d1 = DirMask(v[i-1], v[i]);
+                const int d2 = DirMask(v[i],   v[i+1]);
+                if (d1 == 0 || d1 != d2) continue;      // reversal: keep
+                v.erase(v.begin() + i);
+                again = true;
+            }
+        }
+    }
+
+    // Interior points of an orthogonal link a -> b.  off == 0 is one corner;
+    // off != 0 is a Z jog whose middle corridor sits off the original column.
+    std::vector<wxPoint> OrthoLink(const wxPoint& a, const wxPoint& b,
+                                   bool verticalFirst, int off)
+    {
+        std::vector<wxPoint> mid;
+        if (a == b || a.x == b.x || a.y == b.y) return mid;
+        if (off == 0)
+        {
+            mid.push_back(verticalFirst ? wxPoint(a.x, b.y) : wxPoint(b.x, a.y));
+            return mid;
+        }
+        if (verticalFirst)
+        {
+            mid.push_back(wxPoint(a.x + off, a.y));
+            mid.push_back(wxPoint(a.x + off, b.y));
+        }
+        else
+        {
+            mid.push_back(wxPoint(a.x, a.y + off));
+            mid.push_back(wxPoint(b.x, a.y + off));
+        }
+        return mid;
+    }
+
+    // Make every consecutive pair share an axis.  This is what guarantees a
+    // two-point run whose ends moved diagonally never becomes a slanted wire.
+    void Orthogonalize(std::vector<wxPoint>& v, bool verticalFirst, int off)
+    {
+        if (v.empty()) return;
+        std::vector<wxPoint> r;
+        r.reserve(v.size() + 4);
+        r.push_back(v[0]);
+        for (size_t i = 1; i < v.size(); ++i)
+        {
+            const wxPoint a = r.back();
+            const wxPoint b = v[i];
+            if (a.x != b.x && a.y != b.y)
+            {
+                const std::vector<wxPoint> mid = OrthoLink(a, b, verticalFirst, off);
+                for (size_t k = 0; k < mid.size(); ++k) r.push_back(mid[k]);
+            }
+            r.push_back(b);
+        }
+        v.swap(r);
+    }
+
+    // mode 0 = slide the adjacent bend (legacy stretch);
+    // mode 1 = keep the bend and let Orthogonalize add a stub near the end.
+    std::vector<wxPoint> BuildStretch(const std::vector<wxPoint>& pts,
+                                      const wxPoint& na, const wxPoint& nb,
+                                      int headMode, int headOff,
+                                      int tailMode, int tailOff,
+                                      bool verticalFirst, int linkOff)
+    {
+        std::vector<wxPoint> v = pts;
+        if (v.size() < 2) return v;
+        const size_t n = v.size();
+
+        if (!(na == pts.front()))
+        {
+            if (headMode == 0 && n >= 3)
+            {
+                const wxPoint p1 = pts[1];
+                if      (pts[1].y == pts[0].y) v[1] = wxPoint(p1.x + headOff, na.y);
+                else if (pts[1].x == pts[0].x) v[1] = wxPoint(na.x, p1.y + headOff);
+                else                           v[1] = wxPoint(p1.x + headOff, na.y);
+            }
+            v[0] = na;
+        }
+        if (!(nb == pts.back()))
+        {
+            if (tailMode == 0 && n >= 3)
+            {
+                const wxPoint q = pts[n - 2];
+                if      (q.y == pts[n - 1].y) v[n - 2] = wxPoint(q.x + tailOff, nb.y);
+                else if (q.x == pts[n - 1].x) v[n - 2] = wxPoint(nb.x, q.y + tailOff);
+                else                          v[n - 2] = wxPoint(q.x + tailOff, nb.y);
+            }
+            v[n - 1] = nb;
+        }
+
+        Orthogonalize(v, verticalFirst, linkOff);
+        CleanRun(v);
+        return v;
+    }
+
+    std::vector<wxPoint> Seg(const wxPoint& a, const wxPoint& b)
+    {
+        std::vector<wxPoint> s;
+        s.push_back(a);
+        s.push_back(b);
+        return s;
+    }
+}
+
+std::vector<wxPoint> wnStretchRun(const std::vector<wxPoint>& pts,
+                                  const wxPoint& na, const wxPoint& nb,
+                                  int slideOffset)
+{
+    // A non-zero offset has to reach BOTH the elbow and the Z that leads back
+    // to the next interior bend.  Passing it as linkOff as well is what really
+    // moves the corridor; with a plain corner the offset would be absorbed and
+    // the result would silently collapse back to the unshifted shape.
+    return BuildStretch(pts, na, nb, 0, slideOffset, 0, slideOffset,
+                        true, slideOffset);
+}
+
+std::vector<std::vector<wxPoint>> wnStretchCandidates(
+    const std::vector<wxPoint>& pts, const wxPoint& na, const wxPoint& nb,
+    int maxOffset)
+{
+    std::vector<std::vector<wxPoint>> out;
+    if (pts.size() < 2) { out.push_back(pts); return out; }
+    if (maxOffset < 0) maxOffset = 0;
+
+    // The plain legacy stretch is always first: whenever it is electrically
+    // safe it is the least invasive shape and must win.
+    out.push_back(wnStretchRun(pts, na, nb, 0));
+
+    auto add = [&](const std::vector<wxPoint>& p)
+    {
+        if (p.size() < 2) return;
+        for (size_t i = 0; i + 1 < p.size(); ++i)
+            if (p[i].x != p[i+1].x && p[i].y != p[i+1].y) return;  // never slanted
+        for (size_t i = 0; i < out.size(); ++i) if (out[i] == p) return;
+        out.push_back(p);
+    };
+
+    std::vector<int> offs;
+    offs.push_back(0);
+    for (int k = 1; k <= maxOffset; ++k) { offs.push_back(k); offs.push_back(-k); }
+
+    for (size_t oi = 0; oi < offs.size(); ++oi)
+    {
+        const int off = offs[oi];
+        for (int hm = 0; hm < 2; ++hm)
+            for (int tm = 0; tm < 2; ++tm)
+                for (int vf = 0; vf < 2; ++vf)
+                    add(BuildStretch(pts, na, nb, hm, off, tm, off,
+                                     vf != 0, 0));
+    }
+    return out;
+}
+
+namespace
+{
+    struct MoveScore
+    {
+        long long topo     = 0;
+        long long slant    = 0;
+        long long dots     = 0;
+        long long overlap  = 0;
+        long long lostBend = 0;
+        long long len      = 0;
+        long long segs     = 0;
+        long long choice   = 0;
+
+        bool operator<(const MoveScore& o) const
+        {
+            if (topo     != o.topo)     return topo     < o.topo;
+            if (slant    != o.slant)    return slant    < o.slant;
+            if (dots     != o.dots)     return dots     < o.dots;
+            if (overlap  != o.overlap)  return overlap  < o.overlap;
+            if (lostBend != o.lostBend) return lostBend < o.lostBend;
+            if (len      != o.len)      return len      < o.len;
+            if (segs     != o.segs)     return segs     < o.segs;
+            return choice < o.choice;
+        }
+    };
+
+    // Per-port "who am I tied to" table.  Unlike a binary equality test this
+    // gives the search a gradient, so it can climb out of a candidate that
+    // shorts two nets instead of stalling on a flat failure.
+    std::vector<std::vector<int>> PartnerTable(
+        const std::vector<std::vector<int>>& groups, int nports)
+    {
+        std::vector<std::vector<int>> table((size_t)nports);
+        for (size_t g = 0; g < groups.size(); ++g)
+            for (size_t k = 0; k < groups[g].size(); ++k)
+            {
+                const int p = groups[g][k];
+                if (p >= 0 && p < nports) table[(size_t)p] = groups[g];
+            }
+        return table;
+    }
+
+    long long TopoDistance(const std::vector<std::vector<int>>& got,
+                           const std::vector<std::vector<int>>& want,
+                           int nports)
+    {
+        const std::vector<std::vector<int>> a = PartnerTable(got,  nports);
+        const std::vector<std::vector<int>> b = PartnerTable(want, nports);
+        long long d = 0;
+        for (int i = 0; i < nports; ++i)
+            if (a[(size_t)i] != b[(size_t)i]) ++d;
+        const long long extra = (long long)got.size() - (long long)want.size();
+        d += (extra < 0) ? -extra : extra;
+        return d;
+    }
+
+    // Segments lying on top of each other are a latent short even when the two
+    // happen to be in the same net already.  Count them so the avoidance pass
+    // prefers a clean corridor over a coincident one.
+    int CollinearOverlaps(const std::vector<std::vector<wxPoint>>& segs)
+    {
+        int n = 0;
+        for (size_t i = 0; i < segs.size(); ++i)
+        {
+            if (segs[i].size() != 2) continue;
+            const wxPoint a = segs[i][0], b = segs[i][1];
+            for (size_t j = i + 1; j < segs.size(); ++j)
+            {
+                if (segs[j].size() != 2) continue;
+                const wxPoint c = segs[j][0], d = segs[j][1];
+                if (a.y == b.y && c.y == d.y && a.y == c.y)
+                {
+                    const int lo = std::max(std::min(a.x,b.x), std::min(c.x,d.x));
+                    const int hi = std::min(std::max(a.x,b.x), std::max(c.x,d.x));
+                    if (lo < hi) ++n;
+                }
+                else if (a.x == b.x && c.x == d.x && a.x == c.x)
+                {
+                    const int lo = std::max(std::min(a.y,b.y), std::min(c.y,d.y));
+                    const int hi = std::min(std::max(a.y,b.y), std::max(c.y,d.y));
+                    if (lo < hi) ++n;
+                }
+            }
+        }
+        return n;
+    }
+}
+
+std::vector<std::vector<wxPoint>> wnChooseMovePaths(
+    const std::vector<wnMoveRun>& runs,
+    const std::vector<std::vector<wxPoint>>& ambient,
+    const std::vector<std::vector<wxPoint>>& beforeSegs,
+    const std::vector<wxPoint>& beforePorts,
+    const std::vector<wxPoint>& afterPorts,
+    const std::vector<wxPoint>& junctionPos,
+    int maxOffset)
+{
+    std::vector<std::vector<std::vector<wxPoint>>> cands(runs.size());
+    for (size_t u = 0; u < runs.size(); ++u)
+    {
+        std::vector<std::vector<wxPoint>>& c = cands[u];
+        if (!runs[u].router.empty()) c.push_back(runs[u].router);
+
+        std::vector<std::vector<wxPoint>> all;
+        if (maxOffset < 0)
+            all.push_back(wnStretchRun(runs[u].pts, runs[u].na, runs[u].nb, 0));
+        else
+            all = wnStretchCandidates(runs[u].pts, runs[u].na, runs[u].nb,
+                                      maxOffset);
+
+        for (size_t k = 0; k < all.size(); ++k)
+        {
+            bool seen = false;
+            for (size_t m = 0; m < c.size() && !seen; ++m)
+                if (c[m] == all[k]) seen = true;
+            if (!seen) c.push_back(all[k]);
+        }
+        if (c.empty())
+            c.push_back(wnStretchRun(runs[u].pts, runs[u].na, runs[u].nb, 0));
+    }
+
+    const std::vector<std::vector<int>> want =
+        wnPortGroups(beforeSegs, beforePorts, junctionPos);
+    const int dotsBefore = wnJunctionCount(beforeSegs, junctionPos);
+    const int ovBefore   = CollinearOverlaps(beforeSegs);
+    const int nports = (int)(beforePorts.size() > afterPorts.size()
+                             ? beforePorts.size() : afterPorts.size());
+
+    // A drag calls this on every mouse move.  Cap the work so a large circuit
+    // cannot turn a drag into a stutter; a normal drag stops after the very
+    // first evaluation anyway (candidate 0 is already electrically perfect).
+    long long budget = 6000;
+
+    auto evaluate = [&](const std::vector<int>& choice) -> MoveScore
+    {
+        --budget;
+        MoveScore s;
+        std::vector<std::vector<wxPoint>> polys = ambient;
+        for (size_t u = 0; u < runs.size(); ++u)
+        {
+            const std::vector<wxPoint>& p = cands[u][(size_t)choice[u]];
+            for (size_t k = 0; k + 1 < p.size(); ++k)
+                if (!(p[k] == p[k+1])) polys.push_back(Seg(p[k], p[k+1]));
+
+            // Among electrically equivalent geometries, keep the bends the
+            // user actually drew rather than silently straightening a run.
+            const std::vector<wxPoint>& sk = runs[u].pts;
+            for (size_t k = 1; k + 1 < sk.size(); ++k)
+            {
+                bool kept = false;
+                for (size_t m = 0; m < p.size() && !kept; ++m)
+                    if (p[m] == sk[k]) kept = true;
+                if (!kept) ++s.lostBend;
+            }
+        }
+
+        for (size_t i = 0; i < polys.size(); ++i)
+            for (size_t k = 0; k + 1 < polys[i].size(); ++k)
+            {
+                const wxPoint a = polys[i][k], b = polys[i][k+1];
+                if (a.x != b.x && a.y != b.y) ++s.slant;
+                s.len += std::abs(b.x - a.x) + std::abs(b.y - a.y);
+                ++s.segs;
+            }
+
+        s.topo = TopoDistance(wnPortGroups(polys, afterPorts, junctionPos),
+                              want, nports);
+        const int dots = wnJunctionCount(polys, junctionPos);
+        s.dots = std::max(0, dots - dotsBefore);
+        s.overlap = std::max(0, CollinearOverlaps(polys) - ovBefore);
+        for (size_t u = 0; u < choice.size(); ++u) s.choice += choice[u];
+        return s;
+    };
+
+    std::vector<int> choice(runs.size(), 0);
+    MoveScore best = evaluate(choice);
+
+    // Coordinate descent: change one run at a time, always keeping the whole
+    // geometry's score.  No candidate is accepted unconditionally -- a pass
+    // that breaks the port grouping loses to any pass that preserves it.
+    if (maxOffset >= 0)
+    {
+        for (int round = 0; round < 3 && budget > 0; ++round)
+        {
+            if (best.topo == 0 && best.slant == 0 &&
+                best.dots == 0 && best.overlap == 0) break;
+
+            bool improved = false;
+            for (size_t u = 0; u < runs.size() && budget > 0; ++u)
+            {
+                // Stop as soon as a fully clean geometry is reached; there is
+                // no reason to keep scanning the remaining runs this round.
+                if (best.topo == 0 && best.slant == 0 &&
+                    best.dots == 0 && best.overlap == 0) break;
+
+                int localBest = choice[u];
+                MoveScore localScore = best;
+                for (int c = 0; c < (int)cands[u].size() && budget > 0; ++c)
+                {
+                    if (c == choice[u]) continue;
+                    std::vector<int> trial = choice;
+                    trial[u] = c;
+                    const MoveScore s = evaluate(trial);
+                    if (s < localScore) { localScore = s; localBest = c; }
+                }
+                if (localBest != choice[u])
+                {
+                    choice[u] = localBest;
+                    best = localScore;
+                    improved = true;
+                }
+            }
+            if (!improved) break;
+        }
+    }
+
+    std::vector<std::vector<wxPoint>> result(runs.size());
+    for (size_t u = 0; u < runs.size(); ++u)
+        result[u] = cands[u][(size_t)choice[u]];
+    return result;
 }
 
 // ---------------------------------------------------------------------------

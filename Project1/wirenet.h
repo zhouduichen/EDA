@@ -160,6 +160,81 @@ std::vector<wnNet> wnBuildNets(const std::vector<std::vector<wxPoint>>& polys,
                                const std::vector<std::pair<int, int>>& portAlias
                                    = std::vector<std::pair<int, int>>());
 
+// A canonical description of which ports are electrically tied together.
+// Port indices (not coordinates) are used, so two geometries can be compared
+// even though the ports themselves moved.  Net order and port order are both
+// normalised, and a port that is unconnected appears in no group at all.
+//
+// This is the invariant a move repair must preserve: dragging a component may
+// stretch its wires, but must never merge two nets or orphan a port.
+std::vector<std::vector<int>> wnPortGroups(
+    const std::vector<std::vector<wxPoint>>& polys,
+    const std::vector<wxPoint>& portPos,
+    const std::vector<wxPoint>& junctionPos = std::vector<wxPoint>());
+
+// How many junction dots the canvas would paint for this geometry.  Used to
+// prefer the repair candidate that does not invent new connection marks.
+int wnJunctionCount(const std::vector<std::vector<wxPoint>>& polys,
+                    const std::vector<wxPoint>& junctionPos
+                        = std::vector<wxPoint>());
+
+// Stretch a polyline run so its ends land on na / nb while KEEPING the bend
+// skeleton: only the bend next to a moved end slides along the run's last leg.
+//
+// The router used by a drag is free to drop interior bends, and on one real
+// circuit that moved a wire onto the column of an unrelated run, shorting two
+// nets.  Sliding the last bend instead keeps the original column/row, so the
+// stretched wire still crosses the other run the way it did before the drag.
+// slideOffset steps the sliding bend column/row sideways to get out of a
+// corridor already occupied by another wire.  Zero is the plain stretch.
+//
+// The result is ALWAYS an orthogonal polyline with no zero-length legs, even
+// when a two-point run's ends move diagonally (the old code emitted a slanted
+// segment there).  Collinear reversal points -- a genuine spur another wire
+// branches off -- are preserved rather than normalised away.
+std::vector<wxPoint> wnStretchRun(const std::vector<wxPoint>& pts,
+                                  const wxPoint& na, const wxPoint& nb,
+                                  int slideOffset = 0);
+
+// Every plausible skeleton-preserving, orthogonal reconnection of a run whose
+// ends moved, ordered least to most invasive: bend slide, stub (bend kept, a
+// corner inserted near the moved end) and lateral corridor shifts.  The drag
+// repair scores these against the OTHER wires and keeps the one that preserves
+// the electrical topology -- this is the "avoidance" fallback.
+std::vector<std::vector<wxPoint>> wnStretchCandidates(
+    const std::vector<wxPoint>& pts, const wxPoint& na, const wxPoint& nb,
+    int maxOffset = 4);
+
+// One run the drag repair has to re-lay.  `router` is the candidate the
+// ordinary router produced; an empty router means it is not available.
+struct wnMoveRun
+{
+    std::vector<wxPoint> pts;      // pre-drag skeleton, interior bends relocated
+    wxPoint na, nb;                // where the two ends have to land
+    std::vector<wxPoint> router;   // may be empty
+};
+
+// Choose one orthogonal path per run.  `ambient` polylines are always present
+// (unchanged runs, dragged runs repaired segment by segment).
+//
+// Each candidate geometry is measured with the SAME net extractor the canvas
+// draws with: port grouping must survive, no slanted segment may appear, no
+// extra junction dot or collinear overlap may be invented.  A coordinate
+// descent over the per-run candidate lists finds the least invasive geometry
+// that satisfies all of them; the search never silently accepts a candidate
+// that shorts two nets just because it is the last one tried.
+//
+// maxOffset < 0 disables the avoidance search (candidate 0 only), which is
+// what callers with a changing port set need.
+std::vector<std::vector<wxPoint>> wnChooseMovePaths(
+    const std::vector<wnMoveRun>& runs,
+    const std::vector<std::vector<wxPoint>>& ambient,
+    const std::vector<std::vector<wxPoint>>& beforeSegs,
+    const std::vector<wxPoint>& beforePorts,
+    const std::vector<wxPoint>& afterPorts,
+    const std::vector<wxPoint>& junctionPos,
+    int maxOffset = 3);
+
 // ---------------------------------------------------------------------------
 // Move repair (Logisim "WireRepair")
 //

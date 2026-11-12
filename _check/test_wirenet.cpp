@@ -3,6 +3,7 @@
 #include "wirenet.h"
 
 #include <cstdio>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <utility>
@@ -593,6 +594,380 @@ static void TestCrossing()
     Check(wnBuildNets(c, std::vector<wxPoint>()).size() == 1, "contained wire joins the long one");
 }
 
+// ---------------------------------------------------------------------------
+// Regression: a real drag silently shorted two nets.
+//
+// The user saved 电路1.circ (before) and 电路2.circ (after dragging AND gate
+// comp 15 from (-28,-7) to (-24,-8)).  The router moved group 15's vertical
+// leg from x=-32 onto x=-30, the very column used by group 13's leg.  Their
+// overlap made "an end landing inside another wire" at (-30,-11) and (-30,-7),
+// merging two nets and painting two phantom junction dots.
+//
+// These are the exact WIRE lines of the saved files, so the test is not a
+// made-up approximation of the failure.
+// ---------------------------------------------------------------------------
+
+static std::vector<wxPoint> Seg(int x1, int y1, int x2, int y2)
+{
+    std::vector<wxPoint> p;
+    p.push_back(wxPoint(x1, y1));
+    p.push_back(wxPoint(x2, y2));
+    return p;
+}
+
+static std::vector<wxPoint> Run(std::initializer_list<wxPoint> pts)
+{
+    return std::vector<wxPoint>(pts);
+}
+
+static void TestMoveTopologyGuard()
+{
+    // Port index -> grid position, before and after.  Index is the identity
+    // used by the guard; only comp 15's three ports moved.
+    const std::vector<wxPoint> pb = Run({
+        wxPoint(-35,-16), wxPoint(-35,-11),
+        wxPoint(-25,-18), wxPoint(-25,-16), wxPoint(-23,-17),
+        wxPoint(-28,-6),  wxPoint(-28,-4),  wxPoint(-26,-5)});
+    const std::vector<wxPoint> pa = Run({
+        wxPoint(-35,-16), wxPoint(-35,-11),
+        wxPoint(-25,-18), wxPoint(-25,-16), wxPoint(-23,-17),
+        wxPoint(-24,-7),  wxPoint(-24,-5),  wxPoint(-22,-6)});
+
+    std::vector<std::vector<wxPoint>> before;
+    before.push_back(Seg(-35,-16, -30,-16));   // g13
+    before.push_back(Seg(-30,-16, -30,-6));
+    before.push_back(Seg(-30,-6,  -28,-6));
+    before.push_back(Seg(-30,-16, -28,-16));   // g14
+    before.push_back(Seg(-28,-16, -28,-18));
+    before.push_back(Seg(-28,-18, -25,-18));
+    before.push_back(Seg(-35,-11, -32,-11));   // g15, vertical at x=-32
+    before.push_back(Seg(-32,-11, -32,-4));
+    before.push_back(Seg(-32,-4,  -28,-4));
+
+    std::vector<std::vector<wxPoint>> routed;
+    routed.push_back(Seg(-35,-16, -30,-16));
+    routed.push_back(Seg(-30,-16, -30,-7));
+    routed.push_back(Seg(-30,-7,  -24,-7));
+    routed.push_back(Seg(-30,-16, -28,-16));
+    routed.push_back(Seg(-28,-16, -28,-18));
+    routed.push_back(Seg(-28,-18, -25,-18));
+    routed.push_back(Seg(-35,-11, -30,-11));   // g15, vertical at x=-30 <-- short
+    routed.push_back(Seg(-30,-11, -30,-5));
+    routed.push_back(Seg(-30,-5,  -24,-5));
+
+    const std::vector<std::vector<int>> expected = {{0, 2, 5}, {1, 6}};
+
+    Check(wnPortGroups(before, pb) == expected,
+          "before: two independent nets", "");
+    Check(wnJunctionCount(before) == 1,
+          "before: exactly one junction dot", "");
+    Check(wnJunctionCount(routed) == 3,
+          "bug reproduced: drag paints two extra dots", "");
+    Check(wnPortGroups(routed, pa) != expected,
+          "guard must REJECT the routed candidate", "");
+    Check(wnPortGroups(routed, pa).size() == 1 &&
+          wnPortGroups(routed, pa)[0] == std::vector<int>({0, 1, 2, 5, 6}),
+          "bug reproduced: the two nets are shorted", "");
+
+    // The fallback keeps each run in its original column and just slides the
+    // bend next to the moved end.
+    const std::vector<wxPoint> g13 = Run({wxPoint(-35,-16), wxPoint(-30,-16),
+                                          wxPoint(-30,-6),  wxPoint(-28,-6)});
+    const std::vector<wxPoint> g15 = Run({wxPoint(-35,-11), wxPoint(-32,-11),
+                                          wxPoint(-32,-4),  wxPoint(-28,-4)});
+    const std::vector<wxPoint> g14 = Run({wxPoint(-30,-16), wxPoint(-28,-16),
+                                          wxPoint(-28,-18), wxPoint(-25,-18)});
+
+    const std::vector<wxPoint> s13 = wnStretchRun(g13, g13.front(), wxPoint(-24,-7));
+    const std::vector<wxPoint> s15 = wnStretchRun(g15, g15.front(), wxPoint(-24,-5));
+    const std::vector<wxPoint> s14 = wnStretchRun(g14, g14.front(), g14.back());
+
+    Check(s13 == Run({wxPoint(-35,-16), wxPoint(-30,-16),
+                      wxPoint(-30,-7),  wxPoint(-24,-7)}),
+          "stretch g13 keeps x=-30 and slides the last bend", Dump(s13));
+    Check(s15 == Run({wxPoint(-35,-11), wxPoint(-32,-11),
+                      wxPoint(-32,-5),  wxPoint(-24,-5)}),
+          "stretch g15 keeps x=-32 and slides the last bend", Dump(s15));
+    Check(s14 == g14, "untouched run is left unchanged", Dump(s14));
+
+    std::vector<std::vector<wxPoint>> stretched;
+    for (const std::vector<wxPoint>* r : {&s13, &s14, &s15})
+        for (size_t i = 0; i + 1 < r->size(); ++i)
+            stretched.push_back(Seg((*r)[i].x, (*r)[i].y,
+                                   (*r)[i+1].x, (*r)[i+1].y));
+
+    Check(wnPortGroups(stretched, pa) == expected,
+          "fallback preserves the port grouping", "");
+    Check(wnJunctionCount(stretched) == 1,
+          "fallback paints no phantom dots", "");
+    Check(wnJunctionCount(stretched) == wnJunctionCount(before),
+          "dot count is unchanged by the drag", "");
+
+    // ---- wnStretchRun edge cases -------------------------------------------
+    const std::vector<wxPoint> bent = Run({wxPoint(0,0), wxPoint(5,0),
+                                           wxPoint(5,5), wxPoint(10,5)});
+    Check(wnStretchRun(bent, bent.front(), wxPoint(12,8)) ==
+          Run({wxPoint(0,0), wxPoint(5,0), wxPoint(5,8), wxPoint(12,8)}),
+          "tail end moved", "");
+    Check(wnStretchRun(bent, wxPoint(0,2), bent.back()) ==
+          Run({wxPoint(0,2), wxPoint(5,2), wxPoint(5,5), wxPoint(10,5)}),
+          "head end moved", "");
+    Check(wnStretchRun(bent, wxPoint(0,2), wxPoint(12,8)) ==
+          Run({wxPoint(0,2), wxPoint(5,2), wxPoint(5,8), wxPoint(12,8)}),
+          "both ends moved", "");
+    Check(Ortho(wnStretchRun(bent, wxPoint(0,2), wxPoint(12,8))),
+          "stretched run stays Manhattan", "");
+    Check(wnStretchRun(Run({wxPoint(0,0), wxPoint(5,0), wxPoint(10,0)}),
+                       wxPoint(0,0), wxPoint(12,0)) ==
+          Run({wxPoint(0,0), wxPoint(12,0)}),
+          "collinear middle vertex is normalised away", "");
+
+    // ---- junction counting / explicit marks --------------------------------
+    std::vector<std::vector<wxPoint>> cross;
+    cross.push_back(Seg(0,0, 4,0));
+    cross.push_back(Seg(2,-2, 2,2));
+    Check(wnJunctionCount(cross) == 0,
+          "plain crossing paints no dot", "");
+    std::vector<wxPoint> mark; mark.push_back(wxPoint(2,0));
+    Check(wnJunctionCount(cross, mark) == 1,
+          "explicit mark paints one dot", "");
+    Check(wnBuildNets(cross, std::vector<wxPoint>(), mark).size() == 1,
+          "explicit mark joins the crossing", "");
+}
+
+// ---------------------------------------------------------------------------
+// Avoidance fallback -- the four .circ files the user reported.
+//
+// Every WIRE line below is taken verbatim from C:\Users\34854\Desktop\电路1.circ
+// / 电路2.circ / 自定义1.circ / 自定义2.circ.  These are real saved circuits,
+// not made-up approximations of the failure.
+// ---------------------------------------------------------------------------
+
+static int SlantCount(const std::vector<std::vector<wxPoint>>& segs)
+{
+    int n = 0;
+    for (size_t i = 0; i < segs.size(); ++i)
+        if (segs[i].size() == 2 &&
+            segs[i][0].x != segs[i][1].x && segs[i][0].y != segs[i][1].y) ++n;
+    return n;
+}
+
+static bool HasPoint(const std::vector<wxPoint>& path, int x, int y)
+{
+    for (size_t i = 0; i < path.size(); ++i)
+        if (path[i] == wxPoint(x, y)) return true;
+    return false;
+}
+
+static std::vector<std::vector<wxPoint>> Flatten(
+    const std::vector<std::vector<wxPoint>>& ambient,
+    const std::vector<std::vector<wxPoint>>& paths)
+{
+    std::vector<std::vector<wxPoint>> all = ambient;
+    for (size_t i = 0; i < paths.size(); ++i)
+        for (size_t k = 0; k + 1 < paths[i].size(); ++k)
+            if (!(paths[i][k] == paths[i][k + 1]))
+                all.push_back(Seg(paths[i][k].x, paths[i][k].y,
+                                  paths[i][k+1].x, paths[i][k+1].y));
+    return all;
+}
+
+static void TestStretchOrthogonality()
+{
+    // A two-point run whose ends move diagonally used to become a SLANTED wire
+    // (自定义2.circ group 3: (25,4) -> (31,9)).  It must never happen again.
+    const std::vector<wxPoint> two = Run({wxPoint(25,9), wxPoint(31,9)});
+    const std::vector<wxPoint> s1 = wnStretchRun(two, wxPoint(25,4), wxPoint(31,9));
+    Check(Ortho(s1), "two-point run stays Manhattan when one end moves", Dump(s1));
+    Check(s1.size() >= 3, "two-point run gains a real corner", Dump(s1));
+    Check(s1.front() == wxPoint(25,4) && s1.back() == wxPoint(31,9),
+          "two-point run still lands on both ends", Dump(s1));
+
+    const std::vector<wxPoint> s2 =
+        wnStretchRun(Run({wxPoint(0,0), wxPoint(10,0)}), wxPoint(1,2), wxPoint(12,5));
+    Check(Ortho(s2), "two-point run stays Manhattan when both ends move", Dump(s2));
+
+    // (9,3) is a genuine spur: group 17's wire starts there.  wnNormalize
+    // used to merge it away and disconnect the branch.
+    const std::vector<wxPoint> spur = Run({wxPoint(4,4), wxPoint(9,4),
+                                           wxPoint(9,3), wxPoint(9,11),
+                                           wxPoint(13,11)});
+    const std::vector<wxPoint> s3 = wnStretchRun(spur, wxPoint(4,6), wxPoint(13,11));
+    Check(Ortho(s3), "spur run stays Manhattan", Dump(s3));
+    Check(HasPoint(s3, 9, 3), "collinear reversal spur is preserved", Dump(s3));
+
+    // Every avoidance candidate must be orthogonal and non-degenerate.
+    const std::vector<std::vector<wxPoint>> cand =
+        wnStretchCandidates(spur, wxPoint(4,6), wxPoint(13,11), 3);
+    Check(cand.size() > 8, "avoidance search has a real candidate set", "");
+    bool allOrtho = true, allEnds = true, hasStub = false;
+    for (size_t i = 0; i < cand.size(); ++i)
+    {
+        if (!Ortho(cand[i]) || cand[i].size() < 2) allOrtho = false;
+        if (cand[i].front() != wxPoint(4,6) || cand[i].back() != wxPoint(13,11))
+            allEnds = false;
+        if (HasPoint(cand[i], 4, 4) && HasPoint(cand[i], 9, 4)) hasStub = true;
+    }
+    Check(allOrtho, "every avoidance candidate is orthogonal", "");
+    Check(allEnds,  "every avoidance candidate keeps both port ends", "");
+    Check(hasStub,  "candidate set contains the corridor-avoiding stub", "");
+
+    // slideOffset must actually move the sliding bend's corridor.
+    const std::vector<wxPoint> off = wnStretchRun(
+        Run({wxPoint(0,0), wxPoint(5,0), wxPoint(5,5), wxPoint(10,5)}),
+        wxPoint(0,0), wxPoint(12,8), 2);
+    Check(Ortho(off), "offset stretch is orthogonal", Dump(off));
+    Check(off != wnStretchRun(
+              Run({wxPoint(0,0), wxPoint(5,0), wxPoint(5,5), wxPoint(10,5)}),
+              wxPoint(0,0), wxPoint(12,8)),
+          "slideOffset changes the geometry", Dump(off));
+}
+
+static void TestAvoidanceCaseA()
+{
+    // 电路1.circ -> 电路2.circ: COMP 16 PIN_IN moves (2,3) -> (2,5).
+    std::vector<std::vector<wxPoint>> amb;
+    amb.push_back(Seg(-35,-16, -30,-16)); amb.push_back(Seg(-30,-16, -30,-7));
+    amb.push_back(Seg(-30,-7,  -24,-7));  amb.push_back(Seg(-30,-16, -28,-16));
+    amb.push_back(Seg(-28,-16, -28,-18)); amb.push_back(Seg(-28,-18, -25,-18));
+    amb.push_back(Seg(-35,-11, -30,-11)); amb.push_back(Seg(-30,-11, -30,-5));
+    amb.push_back(Seg(-30,-5,  -24,-5));  amb.push_back(Seg(9,3, 11,3));
+    amb.push_back(Seg(11,3, 11,6));       amb.push_back(Seg(11,6, 13,6));
+    amb.push_back(Seg(7,6,  10,6));       amb.push_back(Seg(10,6, 10,13));
+    amb.push_back(Seg(10,13,13,13));
+
+    std::vector<std::vector<wxPoint>> before = amb;
+    before.push_back(Seg(4,4, 9,4));  before.push_back(Seg(9,4, 9,3));
+    before.push_back(Seg(9,3, 9,11)); before.push_back(Seg(9,11,13,11));
+
+    // The geometry the OLD code produced (电路2.circ WIRE lines 23..25).
+    std::vector<std::vector<wxPoint>> buggy = amb;
+    buggy.push_back(Seg(4,6, 9,6));  buggy.push_back(Seg(9,6, 9,11));
+    buggy.push_back(Seg(9,11,13,11));
+
+    const int px[16] = {-35,-35,-25,-25,-23,-24,-24,-22,4,7,13,13,15,13,13,15};
+    const int py[16] = {-16,-11,-18,-16,-17,-7,-5,-6,4,6,4,6,5,11,13,12};
+    std::vector<wxPoint> bp, ap;
+    for (int i = 0; i < 16; ++i)
+    { bp.push_back(wxPoint(px[i], py[i])); ap.push_back(wxPoint(px[i], py[i])); }
+    ap[8] = wxPoint(4,6);                       // only comp 16's port moved
+
+    const std::vector<std::vector<int>> want = wnPortGroups(before, bp);
+    Check(want == std::vector<std::vector<int>>({{0,1,2,5,6},{8,11,13},{9,14}}),
+          "A before: three independent nets", "");
+    Check(wnJunctionCount(before) == 4, "A before: four junction dots", "");
+    Check(wnPortGroups(buggy, ap) != want,
+          "A bug reproduced: the port grouping changed", "");
+    Check(wnJunctionCount(buggy) == 4,
+          "A bug has the SAME dot count -- only topology catches it", "");
+
+    std::vector<wnMoveRun> runs(1);
+    runs[0].pts = Run({wxPoint(4,4), wxPoint(9,4), wxPoint(9,3),
+                       wxPoint(9,11), wxPoint(13,11)});
+    runs[0].na  = wxPoint(4,6);
+    runs[0].nb  = wxPoint(13,11);
+    // Deliberately no router candidate: the legacy stretch alone is the buggy
+    // shape, so the avoidance search has to earn the fix by itself.
+
+    const std::vector<std::vector<wxPoint>> chosen =
+        wnChooseMovePaths(runs, amb, before, bp, ap,
+                          std::vector<wxPoint>(), 3);
+    const std::vector<std::vector<wxPoint>> after = Flatten(amb, chosen);
+
+    Check(wnPortGroups(after, ap) == want,
+          "A avoidance preserves the electrical topology", "");
+    Check(wnJunctionCount(after) == 4,
+          "A avoidance invents no extra junction dot", "");
+    Check(SlantCount(after) == 0, "A avoidance emits no slanted wire", "");
+    Check(chosen.size() == 1 && HasPoint(chosen[0], 9, 3),
+          "A avoidance keeps the (9,3) branch attached", Dump(chosen[0]));
+    Check(HasPoint(chosen[0], 9, 4),
+          "A avoidance keeps the original (9,4) bend", Dump(chosen[0]));
+
+    // Mutation guard: without the avoidance search the buggy shape wins.
+    const std::vector<std::vector<wxPoint>> noAvoid =
+        wnChooseMovePaths(runs, amb, before, bp, ap,
+                          std::vector<wxPoint>(), -1);
+    Check(wnPortGroups(Flatten(amb, noAvoid), ap) != want,
+          "A negative control: disabling avoidance reproduces the bug", "");
+}
+
+static void TestAvoidanceCaseB()
+{
+    // 自定义1.circ -> 自定义2.circ: SUB 半加器 moves (7,5) -> (7,0).
+    const std::vector<wxPoint> g1 = Run({wxPoint(-3,8), wxPoint(2,8),
+                                         wxPoint(2,9),  wxPoint(7,9)});
+    const std::vector<wxPoint> g2 = Run({wxPoint(-2,12), wxPoint(2,12),
+                                         wxPoint(2,11),  wxPoint(7,11)});
+    const std::vector<wxPoint> g3 = Run({wxPoint(25,9), wxPoint(31,9)});
+    const std::vector<wxPoint> g4 = Run({wxPoint(25,11), wxPoint(28,11),
+                                         wxPoint(28,12),  wxPoint(31,12)});
+
+    std::vector<std::vector<wxPoint>> before;
+    const std::vector<wxPoint>* gs[4] = {&g1, &g2, &g3, &g4};
+    for (int i = 0; i < 4; ++i)
+        for (size_t k = 0; k + 1 < gs[i]->size(); ++k)
+            before.push_back(Seg((*gs[i])[k].x, (*gs[i])[k].y,
+                                 (*gs[i])[k+1].x, (*gs[i])[k+1].y));
+
+    // 自定义2.circ WIRE lines 12..21 (what the old code produced).
+    std::vector<std::vector<wxPoint>> buggy;
+    buggy.push_back(Seg(-3,8, 2,8));  buggy.push_back(Seg(2,8, 2,4));
+    buggy.push_back(Seg(2,4, 7,4));   buggy.push_back(Seg(-2,12, 2,12));
+    buggy.push_back(Seg(2,12, 2,6));  buggy.push_back(Seg(2,6, 7,6));
+    buggy.push_back(Seg(25,4, 31,9)); buggy.push_back(Seg(25,6, 28,6));
+    buggy.push_back(Seg(28,6, 28,12)); buggy.push_back(Seg(28,12, 31,12));
+
+    const std::vector<wxPoint> bp = Run({
+        wxPoint(7,9),  wxPoint(7,11), wxPoint(25,9),  wxPoint(25,11),
+        wxPoint(-3,8), wxPoint(-2,12), wxPoint(31,9), wxPoint(31,12)});
+    const std::vector<wxPoint> ap = Run({
+        wxPoint(7,4),  wxPoint(7,6),  wxPoint(25,4),  wxPoint(25,6),
+        wxPoint(-3,8), wxPoint(-2,12), wxPoint(31,9), wxPoint(31,12)});
+
+    const std::vector<std::vector<int>> want = wnPortGroups(before, bp);
+    Check(want == std::vector<std::vector<int>>({{0,4},{1,5},{2,6},{3,7}}),
+          "B before: four independent nets", "");
+    Check(wnJunctionCount(before) == 0, "B before: no junction dots", "");
+    Check(wnPortGroups(buggy, ap) != want,
+          "B bug reproduced: two input nets are shorted", "");
+    Check(wnJunctionCount(buggy) == 2,
+          "B bug reproduced: two phantom dots appear", "");
+    Check(SlantCount(buggy) == 1,
+          "B bug reproduced: a slanted wire is emitted", "");
+
+    std::vector<wnMoveRun> runs(4);
+    runs[0].pts = g1; runs[0].na = wxPoint(-3,8);  runs[0].nb = wxPoint(7,4);
+    runs[1].pts = g2; runs[1].na = wxPoint(-2,12); runs[1].nb = wxPoint(7,6);
+    runs[2].pts = g3; runs[2].na = wxPoint(25,4);  runs[2].nb = wxPoint(31,9);
+    runs[3].pts = g4; runs[3].na = wxPoint(25,6);  runs[3].nb = wxPoint(31,12);
+
+    const std::vector<std::vector<wxPoint>> chosen =
+        wnChooseMovePaths(runs, std::vector<std::vector<wxPoint>>(),
+                          before, bp, ap, std::vector<wxPoint>(), 3);
+    const std::vector<std::vector<wxPoint>> after =
+        Flatten(std::vector<std::vector<wxPoint>>(), chosen);
+
+    Check(wnPortGroups(after, ap) == want,
+          "B avoidance preserves all four nets", "");
+    Check(wnJunctionCount(after) == 0,
+          "B avoidance paints no phantom dots", "");
+    Check(SlantCount(after) == 0,
+          "B avoidance emits no slanted wire", "");
+    bool allOrtho = true;
+    for (size_t i = 0; i < chosen.size(); ++i) if (!Ortho(chosen[i])) allOrtho = false;
+    Check(allOrtho, "B every chosen path is Manhattan", "");
+
+    // Mutation guard: no avoidance -> short + slant come back.
+    const std::vector<std::vector<wxPoint>> noAvoid =
+        wnChooseMovePaths(runs, std::vector<std::vector<wxPoint>>(),
+                          before, bp, ap, std::vector<wxPoint>(), -1);
+    const std::vector<std::vector<wxPoint>> bad =
+        Flatten(std::vector<std::vector<wxPoint>>(), noAvoid);
+    Check(wnPortGroups(bad, ap) != want || SlantCount(bad) != 0,
+          "B negative control: disabling avoidance reproduces the bug", "");
+}
+
 int main()
 {
     TestNormalize();
@@ -605,6 +980,10 @@ int main()
     TestRelocate();
     TestDisplacement();
     TestRepairScenario();
+    TestMoveTopologyGuard();
+    TestStretchOrthogonality();
+    TestAvoidanceCaseA();
+    TestAvoidanceCaseB();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

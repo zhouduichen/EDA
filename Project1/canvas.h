@@ -142,6 +142,10 @@ private:
     // Snapshot used by the Logisim style "wire repair" while moving components.
     std::vector<Wire>                 m_wireSnapshot;
     std::map<int, std::vector<wxPoint>> m_portSnapshot;
+    // Explicit connection marks as they were when the drag started.  The
+    // topology guard compares against this, not the live list (PruneJunctions
+    // may thin it out during a drag).
+    std::vector<wxPoint>              m_junctionSnapshot;
 
     bool m_moving = false;
     bool m_moveSnapshotted = false;

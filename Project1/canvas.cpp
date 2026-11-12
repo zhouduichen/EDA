@@ -796,9 +796,11 @@ void CircuitCanvas::SnapshotWiresAndPorts()
 {
     m_wireSnapshot.clear();
     m_portSnapshot.clear();
+    m_junctionSnapshot.clear();
     if (!m_circuit) return;
 
-    m_wireSnapshot = m_circuit->wires;
+    m_wireSnapshot      = m_circuit->wires;
+    m_junctionSnapshot  = m_circuit->junctions;
     for (auto& c : m_circuit->comps)
     {
         std::vector<wxPoint> pts;
@@ -870,19 +872,64 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
         return oldPt;
     };
 
-    auto pushUnique = [](std::vector<Wire>& v, const Wire& w) -> void
+    auto pushUnique = [](std::vector<Wire>& dst, const Wire& w) -> void
     {
         if (w.points.size() != 2) return;
         if (w.points[0] == w.points[1]) return;              // collapsed
-        for (const Wire& o : v)
+        for (const Wire& o : dst)
         {
             if (o.points.size() != 2) continue;
             if ((o.points[0] == w.points[0] && o.points[1] == w.points[1]) ||
                 (o.points[0] == w.points[1] && o.points[1] == w.points[0]))
                 return;                                      // already there
         }
-        v.push_back(w);
+        dst.push_back(w);
     };
+
+    // ---- topology baseline ------------------------------------------------
+    // A drag may stretch wires, but it must never change WHICH PORTS are tied
+    // together.  Port INDEX (not position) is the identity, so the two tables
+    // below line up even though the moved component's ports relocated.
+    //
+    // Without this guard the router is free to drop interior bends and lay a
+    // run in a different corridor.  On one real circuit that put a stretched
+    // run onto the column of an unrelated run; their overlapping vertical legs
+    // then made "an end landing in the middle of another wire", so two nets
+    // were shorted and two phantom junction dots appeared.
+    std::vector<std::vector<wxPoint>> beforeSegs;
+    for (const Wire& w : m_wireSnapshot)
+        if (w.points.size() == 2) beforeSegs.push_back(w.points);
+
+    std::vector<wxPoint> beforePorts, afterPorts;
+    for (const Component& c : m_circuit->comps)
+    {
+        std::map<int, std::vector<wxPoint>>::const_iterator pit =
+            m_portSnapshot.find(c.id);
+        if (pit == m_portSnapshot.end()) continue;
+        for (size_t k = 0; k < pit->second.size() && k < c.ports.size(); ++k)
+        {
+            beforePorts.push_back(pit->second[k]);
+            afterPorts.push_back(c.ports[k].grid);
+        }
+    }
+    // The guard only makes sense while a port INDEX still denotes the same
+    // port.  SetSelectedInputs() changes a gate's port COUNT and then calls
+    // this repair too; there the before/after tables are not comparable, so
+    // the original single-pass behaviour must be kept.
+    bool portSetStable = (m_portSnapshot.size() == m_circuit->comps.size());
+    if (portSetStable)
+    {
+        for (const Component& c : m_circuit->comps)
+        {
+            std::map<int, std::vector<wxPoint>>::const_iterator pit =
+                m_portSnapshot.find(c.id);
+            if (pit == m_portSnapshot.end() || pit->second.size() != c.ports.size())
+            {
+                portSetStable = false;
+                break;
+            }
+        }
+    }
 
     // Component bodies: a re-laid run has to walk around them, never under.
     const std::vector<wnRect> blocks = ComponentBlocks();
@@ -947,6 +994,41 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
             pushUnique(out, nw);
         }
     };
+
+    // Turn a polyline path into one Wire per segment, keeping the port
+    // attachments on the two outer ends.  Both repair candidates share this.
+    auto emitPath = [&](const std::vector<wxPoint>& path, const Wire& tmpl,
+                       int aComp, int aPort, int bComp, int bPort) -> bool
+    {
+        if (path.size() < 2) return false;
+        for (size_t k = 0; k + 1 < path.size(); ++k)
+        {
+            if (path[k] == path[k + 1]) continue;
+            Wire nw = tmpl;
+            nw.points.clear();
+            nw.points.push_back(path[k]);
+            nw.points.push_back(path[k + 1]);
+            nw.srcComp = nw.srcPort = nw.dstComp = nw.dstPort = -1;
+            if (k == 0)               { nw.srcComp = aComp; nw.srcPort = aPort; }
+            if (k + 2 == path.size()) { nw.dstComp = bComp; nw.dstPort = bPort; }
+            pushUnique(out, nw);
+        }
+        return true;
+    };
+
+    // One entry per run that has to be re-laid.  Everything else (a run that
+    // did not move, a run the user is dragging by hand, a run cut into
+    // disjoint pieces) is already written to `out` and becomes the AMBIENT:
+    // the obstacles the avoidance search must not lay a corridor on top of.
+    struct RunEmit
+    {
+        size_t tmpl = 0;
+        int aComp = -1, aPort = -1, bComp = -1, bPort = -1;
+        std::vector<size_t> chain;
+        std::vector<char>   rev;
+    };
+    std::vector<wnMoveRun> moveRuns;
+    std::vector<RunEmit>   emits;
 
     for (size_t gi = 0; gi < groupOrder.size(); ++gi)
     {
@@ -1013,10 +1095,27 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
             for (size_t k = 0; k < chain.size(); ++k) pushUnique(out, m_wireSnapshot[chain[k]]);
             continue;
         }
+        // A run the user is dragging by hand keeps its shape; stretching it is
+        // only meaningful for wires following a moved component.
+        if (runSelected)
+        {
+            for (size_t k = 0; k < chain.size(); ++k) relocateOne(chain[k], rev[k] != 0);
+            continue;
+        }
 
-        // An end glued to a component pin has to keep meeting it from the side,
-        // and the run has to walk around the body instead of under it.  Both
-        // are one job for the router.
+        // Interior bends that travel with a dragged wire have to be relocated
+        // before the skeleton is handed to the candidate generator.
+        std::vector<wxPoint> base = pts;
+        for (size_t k = 1; k + 1 < base.size(); ++k)
+        {
+            std::map<wxPoint, wxPoint, PtLess>::const_iterator dit = disp.find(base[k]);
+            if (dit != disp.end()) base[k] = dit->second;
+        }
+
+        // Candidate 0: the ordinary router.  An end glued to a component pin
+        // has to keep meeting it from the side, and the run has to walk around
+        // the body instead of under it.
+        std::vector<wxPoint> routerPath;
         if (aComp >= 0 || bComp >= 0)
         {
             // Interior corners are free for the router to drop -- except where
@@ -1058,27 +1157,53 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
                 from    = way[k];
                 curSide = WN_ANY;
             }
-
-            if (path.size() >= 2)
-            {
-                const Wire& tmpl = m_wireSnapshot[chain.front()];
-                for (size_t k = 0; k + 1 < path.size(); ++k)
-                {
-                    if (path[k] == path[k + 1]) continue;
-                    Wire nw = tmpl;
-                    nw.points.clear();
-                    nw.points.push_back(path[k]);
-                    nw.points.push_back(path[k + 1]);
-                    nw.srcComp = nw.srcPort = nw.dstComp = nw.dstPort = -1;
-                    if (k == 0)                { nw.srcComp = aComp; nw.srcPort = aPort; }
-                    if (k + 2 == path.size())  { nw.dstComp = bComp; nw.dstPort = bPort; }
-                    pushUnique(out, nw);
-                }
-                continue;
-            }
+            routerPath = path;
+        }
+        else if (!portSetStable)
+        {
+            // Port indices changed (SetSelectedInputs), so no avoidance search
+            // is possible.  Keep the original single-pass behaviour exactly.
+            for (size_t k = 0; k < chain.size(); ++k) relocateOne(chain[k], rev[k] != 0);
+            continue;
         }
 
-        for (size_t k = 0; k < chain.size(); ++k) relocateOne(chain[k], rev[k] != 0);
+        wnMoveRun r;
+        r.pts    = base;
+        r.na     = na;
+        r.nb     = nb;
+        r.router = routerPath;
+        moveRuns.push_back(r);
+
+        RunEmit e;
+        e.tmpl  = chain.front();
+        e.aComp = aComp; e.aPort = aPort;
+        e.bComp = bComp; e.bPort = bPort;
+        e.chain = chain;
+        e.rev   = rev;
+        emits.push_back(e);
+    }
+
+    std::vector<std::vector<wxPoint>> ambient;
+    for (const Wire& w : out)
+        if (w.points.size() == 2 && !(w.points[0] == w.points[1]))
+            ambient.push_back(w.points);
+
+    // The search scores EVERY candidate with the same net extractor the canvas
+    // draws with.  No candidate is accepted just because it is the last one: a
+    // geometry that shorts two nets or invents a junction dot loses to any
+    // geometry that does not.
+    const std::vector<std::vector<wxPoint>> chosen =
+        wnChooseMovePaths(moveRuns, ambient, beforeSegs, beforePorts,
+                          afterPorts, m_junctionSnapshot,
+                          portSetStable ? 3 : -1);
+
+    for (size_t u = 0; u < chosen.size(); ++u)
+    {
+        if (emitPath(chosen[u], m_wireSnapshot[emits[u].tmpl],
+                     emits[u].aComp, emits[u].aPort,
+                     emits[u].bComp, emits[u].bPort)) continue;
+        for (size_t k = 0; k < emits[u].chain.size(); ++k)
+            relocateOne(emits[u].chain[k], emits[u].rev[k] != 0);
     }
 
     m_circuit->wires.swap(out);
