@@ -388,7 +388,7 @@ void MainFrame::SetupMenus()
         for (size_t i = 0; i < File->GetMenuItemCount(); ++i)
             if (File->FindItemByPosition(i) == img) { pos = i + 1; break; }
         File->Insert(pos, wxID_ANY, wxT("导出网表\tCtrl+E"),
-                     wxT("导出 KiCad 格式网表，可被 PCB 软件加载"));
+                     wxT("导出 gEDA 网表（.net）与初始 PCB 布局（.pcb）"));
     }
 
     // Placeholder entries: each of these only printed a status line (a
@@ -1029,26 +1029,56 @@ void MainFrame::DoExportNetlist()
     if (!c) return;
 
     wxFileDialog dlg(this, wxT("导出网表"), wxT(""), wxT("电路.net"),
-                     wxT("KiCad 网表 (*.net)|*.net"),
+                     wxT("gEDA 网表 (*.net)|*.net"),
                      wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dlg.ShowModal() != wxID_OK) return;
     wxString path = dlg.GetPath();
     if (!path.Lower().EndsWith(wxT(".net"))) path += wxT(".net");
 
-    const wxString text = ExportKiCadNetlist(*c, path);
+    const wxString text = ExportGedaNetlist(*c);
     if (text.IsEmpty())
     {
-        wxMessageBox(wxT("生成网表失败。"), wxT("错误"), wxOK | wxICON_ERROR);
+        wxMessageBox(wxT("电路里没有可导出的元件。"), wxT("导出网表"),
+                     wxOK | wxICON_INFORMATION);
         return;
     }
-    wxFile f(path, wxFile::write);
-    if (!f.IsOpened())
+
+    // gsch2pcb gives pcb a netlist and a preliminary layout side by side, so
+    // the layout is written next to the .net the user picked.
+    wxString pcbPath = path;
+    if (pcbPath.Lower().EndsWith(wxT(".net"))) pcbPath = pcbPath.Left(pcbPath.length() - 4);
+    pcbPath += wxT(".pcb");
+    const wxString pcb = ExportGedaPcb(*c);
+
+    // The .net overwrite was already confirmed by the file dialog; saying no
+    // here only skips the layout file, it must not throw away the netlist.
+    bool writePcb = !pcb.IsEmpty();
+    if (writePcb && wxFileExists(pcbPath))
     {
-        wxMessageBox(wxT("无法写入文件。"), wxT("错误"), wxOK | wxICON_ERROR);
-        return;
+        const int answer = wxMessageBox(
+            wxT("同时会覆盖同名的 PCB 布局文件：\n") + pcbPath + wxT("\n\n覆盖它吗？"),
+            wxT("导出网表"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+        writePcb = (answer == wxYES);
     }
-    const std::string utf8 = text.utf8_string();
-    f.Write(utf8.c_str(), utf8.size());
-    f.Close();
-    Status(wxT("已导出网表（电路 ") + c->name + wxT("）：") + path);
+
+    const wxString texts[2] = { text, pcb };
+    const wxString paths[2] = { path, pcbPath };
+    const int count = writePcb ? 2 : 1;
+    for (int i = 0; i < count; ++i)
+    {
+        wxFile f(paths[i], wxFile::write);
+        if (!f.IsOpened())
+        {
+            wxMessageBox(wxT("无法写入文件：") + paths[i], wxT("错误"), wxOK | wxICON_ERROR);
+            return;
+        }
+        const std::string utf8 = texts[i].utf8_string();
+        f.Write(utf8.c_str(), utf8.size());
+        f.Close();
+    }
+    wxString status = wxT("已导出网表（电路 ") + c->name + wxT("）：") + path;
+    if (writePcb)
+        status = wxT("已导出网表与 PCB 布局（电路 ") + c->name + wxT("）：")
+               + path + wxT("、") + pcbPath;
+    Status(status);
 }

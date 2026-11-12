@@ -1,13 +1,25 @@
 ///////////////////////////////////////////////////////////////////////////
-// netlist.h -- KiCad netlist export.
+// netlist.h -- export in the form the gEDA workflow expects.
 //
-// The electrical connectivity comes from the very same net extraction the
-// simulation runs on (wnBuildNets in wirenet.cpp), so what the export calls
-// connected is exactly what the simulation computes.
+// 任务5 的参考流程是 gschem -> gsch2pcb -> pcb:
 //
-// Sub-circuit instances are exported as ordinary black-box components: the
-// ports on the box edge become the pins of the instance, which is what a
-// PCB netlist expects of a hierarchical block.
+//   * gsch2pcb hands pcb two files: a netlist (.net) and a preliminary
+//     layout (.pcb) that already contains one Element() per physical
+//     package, all piled on the same point;
+//   * the netlist is plain text, one line per net:
+//
+//         netname<TAB>refdes-pin refdes-pin ...
+//
+//     (see 任务5参考/文件/full_adder.net);
+//   * pcb matches those refdes-pin pairs against the Element()s and draws
+//     the rats nest.
+//
+// So the gate symbols on the canvas have to be grouped into real ICs:
+// several gates of one 74xx chip share a RefDes and are told apart by the
+// pin numbers only (the reference calls this the slot).  The electrical
+// connectivity itself still comes from wnBuildNets -- the same extraction
+// the simulation runs on -- so what the export calls connected is exactly
+// what the simulator computes.
 ///////////////////////////////////////////////////////////////////////////
 
 #ifndef EDA_NETLIST_H
@@ -27,20 +39,22 @@ struct NlPin
 
 struct NlNet
 {
-    wxString           name;   // "Net-(U1-A)", after the net's first pin
     std::vector<NlPin> pins;
 };
 
 // Group every port of the circuit into nets.  Pure-wire groups (nothing
 // plugged in) are dropped; a net with a single port (a wire end that leads
 // nowhere) is kept.  A port that touches no wire at all is unconnected and
-// does not appear in any net -- exactly how KiCad reports absent pins.
+// does not appear in any net.
 void BuildNetlist(const Circuit& c, std::vector<NlNet>& out);
 
-// The full KiCad netlist text (s-expression, version "E"), ready to be
-// written to a .net file and imported by KiCad's PCB editor
-// ("File -> Import -> Netlist").  `source` is recorded in the (design)
-// section; pass the file path it will be saved under.
-wxString ExportKiCadNetlist(const Circuit& c, const wxString& source);
+// The gEDA pcb text netlist, ready for pcb's "File -> Load netlist".
+// Signal nets are called unnamed_net1..N; every IC package contributes its
+// GND / Vcc pins to the two power nets, exactly like gsch2pcb writes them.
+wxString ExportGedaNetlist(const Circuit& c);
+
+// The preliminary layout file for pcb's "File -> Load layout data to
+// buffer": one Element() per package, pins numbered like the netlist.
+wxString ExportGedaPcb(const Circuit& c);
 
 #endif // EDA_NETLIST_H

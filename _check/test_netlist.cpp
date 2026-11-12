@@ -1,8 +1,10 @@
-// Netlist build + export test, run with the stub wx headers under g++.
+// Netlist build + gEDA export test, run with the stub wx headers under g++.
 #include "model.h"
 #include "netlist.h"
 
 #include <cstdio>
+#include <string>
+#include <vector>
 
 static int g_fail = 0;
 #define EXPECT(cond) do { if (!(cond)) { ++g_fail; printf("FAIL line %d: %s\n", __LINE__, #cond); } } while (0)
@@ -44,57 +46,189 @@ static int Count(const wxString& text, const wxString& what)
     return n;
 }
 
+// Every "REF-PIN" pair the .pcb actually defines.  The two files are
+// generated from the same board model, but the invariant is cheap to check
+// and a mismatch would make pcb silently drop every pin.
+static std::vector<std::string> PcbPins(const wxString& pcb)
+{
+    std::vector<std::string> out;
+    const std::string s = pcb.utf8_string();
+    std::string ref;
+    size_t pos = 0;
+    while (pos < s.size())
+    {
+        size_t eol = s.find('\n', pos);
+        if (eol == std::string::npos) eol = s.size();
+        const std::string line = s.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        if (line.compare(0, 8, "Element(") == 0)
+        {
+            // Element(flags "footprint" "refdes" "value" ...)
+            const size_t q1 = line.find('"');
+            const size_t q2 = (q1 == std::string::npos) ? q1 : line.find('"', q1 + 1);
+            const size_t q3 = (q2 == std::string::npos) ? q2 : line.find('"', q2 + 1);
+            const size_t q4 = (q3 == std::string::npos) ? q3 : line.find('"', q3 + 1);
+            if (q3 != std::string::npos && q4 != std::string::npos)
+                ref = line.substr(q3 + 1, q4 - q3 - 1);
+        }
+        else
+        {
+            const size_t p = line.find("Pin(");
+            if (p == std::string::npos || ref.empty()) continue;
+            const size_t q1 = line.find('"', p);
+            const size_t q2 = (q1 == std::string::npos) ? q1 : line.find('"', q1 + 1);
+            if (q1 == std::string::npos || q2 == std::string::npos) continue;
+            out.push_back(ref + "-" + line.substr(q1 + 1, q2 - q1 - 1));
+        }
+    }
+    return out;
+}
+
+static std::vector<std::string> NetPins(const wxString& net)
+{
+    std::vector<std::string> out;
+    const std::string s = net.utf8_string();
+    size_t pos = 0;
+    while (pos < s.size())
+    {
+        size_t eol = s.find('\n', pos);
+        if (eol == std::string::npos) eol = s.size();
+        const std::string line = s.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        const std::string rest = line.substr(tab + 1);
+        size_t i = 0;
+        while (i < rest.size())
+        {
+            while (i < rest.size() && rest[i] == ' ') ++i;
+            size_t j = i;
+            while (j < rest.size() && rest[j] != ' ') ++j;
+            if (j > i) out.push_back(rest.substr(i, j - i));
+            i = j;
+        }
+    }
+    return out;
+}
+
+static bool Has(const std::vector<std::string>& v, const std::string& s)
+{
+    for (const std::string& x : v) if (x == s) return true;
+    return false;
+}
+
 int main()
 {
-    // ---- test 1: gate circuit, T-join, dangling pin ------------------------
+    // ---- test 1: one AND gate, one package, gEDA line format --------------
     {
         Circuit c;
         AddComp(c, CT_PinIn,  1, 0, 0);
-        AddComp(c, CT_PinIn,  2, 0, 6);
+        AddComp(c, CT_PinIn,  2, 0, 2);
         AddComp(c, CT_And,    3, 10, 0);
-        AddComp(c, CT_Xor,    4, 10, 6);
-        AddComp(c, CT_PinOut, 5, 16, 0);
-        AddComp(c, CT_PinOut, 6, 16, 6);
+        AddComp(c, CT_PinOut, 4, 16, 0);
 
         AddWire(c, 1, 0,  3, 0,   2, 1, 10, 1);   // P1 -> AND.A
-        AddWire(c, 2, 0,  4, 0,   2, 7, 10, 7);   // P2 -> XOR.A
+        AddWire(c, 2, 0,  3, 1,   2, 3, 10, 3);   // P2 -> AND.B
         AddWire(c, 3, 2, -1, -1, 12, 2, 16, 2);   // AND.Y out
-        AddWire(c, -1, -1, 5, 0, 16, 2, 16, 1);   // ... -> P5 (T-join)
-        AddWire(c, 4, 2, -1, -1, 14, 8, 16, 8);   // XOR.Y out (width 4)
-        AddWire(c, -1, -1, 6, 0, 16, 8, 16, 7);   // ... -> P6
+        AddWire(c, -1, -1, 4, 0, 16, 2, 16, 1);   // ... -> P4
 
         std::vector<NlNet> nets;
         BuildNetlist(c, nets);
-        EXPECT(nets.size() == 4);
-        EXPECT(nets[0].name == wxT("Net-(P1-OUT)"));
+        EXPECT(nets.size() == 3);
         EXPECT(nets[0].pins.size() == 2 && nets[0].pins[0].compId == 1
                && nets[0].pins[1].compId == 3);
-        EXPECT(nets[1].name == wxT("Net-(P2-OUT)"));
-        EXPECT(nets[2].name == wxT("Net-(U3-Y)"));
-        EXPECT(nets[3].name == wxT("Net-(U4-Y)"));
+        EXPECT(nets[2].pins.size() == 2 && nets[2].pins[0].compId == 3
+               && nets[2].pins[1].compId == 4);
 
-        wxString text = ExportKiCadNetlist(c, wxT("test.net"));
-        EXPECT(Count(text, wxT("(comp (ref \"")) == 6);
-        EXPECT(Count(text, wxT("(net (code \"")) == 4);
-        EXPECT(Count(text, wxT("(value \"与门\")")) == 1);
-        // every component must carry a real KiCad footprint, or the PCB
-        // editor refuses to place it
-        EXPECT(Count(text, wxT("(footprint \"Package_DIP:DIP-14_W7.62mm\")")) == 2);
-        EXPECT(Count(text,
-            wxT("(footprint \"Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical\")")) == 4);
-        EXPECT(Count(text, wxT("(ref \"U3\") (pin \"3\") (pinfunction \"Y\") (pintype \"output\")")) == 1);
-        EXPECT(Count(text, wxT("(ref \"P1\") (pin \"1\") (pinfunction \"OUT\") (pintype \"passive\")")) == 1);
-        EXPECT(Count(text, wxT("(export (version \"E\")")) == 1);
+        const wxString text = ExportGedaNetlist(c);
+        // name<TAB>refdes-pin, one line per net, exactly like full_adder.net
+        EXPECT(Count(text, wxT("unnamed_net1\tP1-1 U1-1 \n")) == 1);
+        EXPECT(Count(text, wxT("unnamed_net2\tP2-1 U1-2 \n")) == 1);
+        EXPECT(Count(text, wxT("unnamed_net3\tU1-3 P4-1 \n")) == 1);
+        // the package's power pins form the two power nets
+        EXPECT(Count(text, wxT("GND\tU1-7 \n")) == 1);
+        EXPECT(Count(text, wxT("Vcc\tU1-14 \n")) == 1);
+
+        const wxString pcb = ExportGedaPcb(c);
+        EXPECT(Count(pcb, wxT("FileVersion[20070407]")) == 1);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U1\" \"7409\"")) == 1);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"1PIN\" \"P1\" \"CONN\"")) == 1);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"1PIN\" \"P4\" \"CONN\"")) == 1);
+        EXPECT(Count(pcb, wxT("Pin(")) == 17);          // 14 pads + 3 headers
+        EXPECT(Count(pcb, wxT("Layer(10 \"silk\")")) == 1);
     }
 
-    // ---- test 2: sub-circuit instance as a black box ------------------------
+    // ---- test 2: two AND gates share one 7409 package ---------------------
+    {
+        Circuit c;
+        AddComp(c, CT_PinIn,  1, 0, 0);
+        AddComp(c, CT_And,    2, 10, 0);
+        AddComp(c, CT_PinIn,  3, 0, 6);
+        AddComp(c, CT_And,    4, 10, 6);
+
+        AddWire(c, 1, 0, 2, 0, 2, 1, 10, 1);
+        AddWire(c, 3, 0, 4, 0, 2, 7, 10, 7);   // second gate: slot 2, input A = pad 4
+
+        const wxString text = ExportGedaNetlist(c);
+        EXPECT(Count(text, wxT("U1-1 ")) == 1);
+        EXPECT(Count(text, wxT("U1-4 ")) == 1);   // gate 2 input A
+        EXPECT(Count(text, wxT("GND\tU1-7 \n")) == 1);
+
+        const wxString pcb = ExportGedaPcb(c);
+        EXPECT(Count(pcb, wxT("\"7409\"")) == 1);  // one chip, not two
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U1\" \"7409\"")) == 1);
+    }
+
+    // ---- test 3: seven inverters fit in two 7404 packages -----------------
+    {
+        Circuit c;
+        for (int i = 0; i < 7; ++i) AddComp(c, CT_Not, i + 1, 10, 4 * i);
+        // The seventh inverter is gate 1 of the second chip, input on pad 1.
+        AddComp(c, CT_PinIn, 8, 0, 24);
+        AddWire(c, 8, 0, 7, 0, 2, 25, 10, 25);
+
+        const wxString text = ExportGedaNetlist(c);
+        EXPECT(Count(text, wxT("U2-1 ")) == 1);
+        EXPECT(Count(text, wxT("GND\tU1-7 U2-7 \n")) == 1);
+        EXPECT(Count(text, wxT("Vcc\tU1-14 U2-14 \n")) == 1);
+
+        const wxString pcb = ExportGedaPcb(c);
+        EXPECT(Count(pcb, wxT("\"7404\"")) == 2);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U2\" \"7404\"")) == 1);
+    }
+
+    // ---- test 4: a 6-input gate gets a DIP of its own, pads skip power ----
+    {
+        Circuit c;
+        AddComp(c, CT_Nand, 1, 10, 0, 6);   // 6 inputs + output = 7 ports
+        for (int i = 0; i < 6; ++i)
+        {
+            AddComp(c, CT_PinIn, 10 + i, 0, 2 * i);
+            AddWire(c, 10 + i, 0, 1, i, 2, 2 * i + 1, 10, 2 * i + 1);
+        }
+        AddComp(c, CT_PinOut, 20, 20, 0);
+        AddWire(c, 1, 6, -1, -1, 17, 6, 20, 6);   // gate output (Nand width 7)
+        AddWire(c, -1, -1, 20, 0, 20, 6, 20, 1);
+
+        const wxString text = ExportGedaNetlist(c);
+        EXPECT(Count(text, wxT("U1-6 ")) == 1);    // input F
+        EXPECT(Count(text, wxT("U1-8 ")) == 1);    // output skips pad 7 (GND)
+        EXPECT(Count(text, wxT("U1-7 ")) == 1);    // only in the GND net
+
+        const wxString pcb = ExportGedaPcb(c);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U1\" \"NAND\"")) == 1);
+    }
+
+    // ---- test 5: sub-circuit instance as a black box ----------------------
     {
         std::vector<Circuit> project;
 
         Circuit def;
         def.name = wxT("half");
-        AddComp(def, CT_PinIn,  1, 0, 0, 2, wxT("X"));
-        AddComp(def, CT_PinOut, 2, 6, 0, 2, wxT("S"));
+        AddComp(def, CT_PinIn,  1, 0, 0);
+        AddComp(def, CT_PinOut, 2, 6, 0);
         project.push_back(def);
 
         Circuit main;
@@ -111,48 +245,108 @@ int main()
         main.project = &project;
         main.comps[0].RebuildPorts();
 
-        // the box is 8 x 2: input X on the left edge (10,1), output S (18,1)
         EXPECT(main.comps[0].ports.size() == 2);
-        EXPECT(main.comps[0].ports[0].grid == wxPoint(10, 1));
-        EXPECT(main.comps[0].ports[1].grid == wxPoint(18, 1));
-
         AddWire(main, 2, 0, 1, 0, 2, 1, 10, 1);
 
-        std::vector<NlNet> nets;
-        BuildNetlist(main, nets);
-        // one wired net (X); the unwired S port is unconnected, so it makes
-        // no net at all -- KiCad reads absent pins as unconnected
-        EXPECT(nets.size() == 1);
-        // instance pin carries the definition pin's label
-        EXPECT(nets[0].name == wxT("Net-(U1-X)"));
-        EXPECT(nets[0].pins.size() == 2 && nets[0].pins[0].compId == 1);
+        const wxString text = ExportGedaNetlist(main);
+        // the box pin becomes pad 1 of the instance's own DIP
+        EXPECT(Count(text, wxT("unnamed_net1\tU1-1 P2-1 \n")) == 1);
 
-        wxString text = ExportKiCadNetlist(main, wxT("sub.net"));
-        EXPECT(Count(text, wxT("(part \"SUB\")")) == 1);
-        EXPECT(Count(text, wxT("(ref \"U1\") (pin \"1\") (pinfunction \"X\")")) == 1);
-        EXPECT(Count(text, wxT("(pintype \"passive\")")) == 1);
+        const wxString pcb = ExportGedaPcb(main);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U1\" \"half\"")) == 1);
     }
 
-    // ---- test 3: pad numbering skips the DIP power pads --------------------
+    // ---- test 6: pin-only circuit has no power nets -----------------------
     {
         Circuit c;
-        AddComp(c, CT_Nand, 1, 10, 0, 6);   // 6 inputs + output = 7 ports
-        for (int i = 0; i < 6; ++i)
-        {
-            AddComp(c, CT_PinIn, 10 + i, 0, 2 * i);
-            AddWire(c, 10 + i, 0, 1, i, 2, 2 * i + 1, 10, 2 * i + 1);
-        }
-        AddComp(c, CT_PinOut, 20, 20, 0);
-        AddWire(c, 1, 6, -1, -1, 17, 6, 19, 6);   // gate output (Nand width 7)
-        AddWire(c, -1, -1, -1, -1, 19, 6, 19, 1);
-        AddWire(c, -1, -1, 20, 0, 19, 1, 20, 1);
+        AddComp(c, CT_PinIn,  1, 0, 0);
+        AddComp(c, CT_PinOut, 2, 6, 0);
+        AddWire(c, 1, 0, 2, 0, 2, 1, 6, 1);
 
-        wxString text = ExportKiCadNetlist(c, wxT("dip.net"));
-        EXPECT(Count(text, wxT("(footprint \"Package_DIP:DIP-14_W7.62mm\")")) == 1);
-        // inputs on pads 1..6, output skips pad 7 (GND) and lands on 8
-        EXPECT(Count(text, wxT("(pin \"6\") (pinfunction \"F\")")) == 1);
-        EXPECT(Count(text, wxT("(pin \"8\") (pinfunction \"Y\")")) == 1);
-        EXPECT(Count(text, wxT("(pin \"7\")")) == 0);
+        const wxString text = ExportGedaNetlist(c);
+        EXPECT(Count(text, wxT("unnamed_net1\tP1-1 P2-1 \n")) == 1);
+        EXPECT(Count(text, wxT("GND\t")) == 0);
+        EXPECT(Count(text, wxT("Vcc\t")) == 0);
+
+        const wxString pcb = ExportGedaPcb(c);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"1PIN\"")) == 2);
+    }
+
+    // ---- test 7: the reference full adder becomes U1/U2/U3 ----------------
+    {
+        // 2 x XOR (7486), 2 x AND (7409), 1 x OR (7432), the same five gates
+        // as 任务5参考/文件/full_adder.sch.  Two gates of one chip share the
+        // RefDes; slot 2 sits on pads 4/5/6.
+        Circuit c;
+        AddComp(c, CT_Xor, 1, 10, 0);
+        AddComp(c, CT_Xor, 2, 10, 6);
+        AddComp(c, CT_And, 3, 20, 0);
+        AddComp(c, CT_And, 4, 20, 6);
+        AddComp(c, CT_Or,  5, 30, 0);
+
+        const wxString pcb = ExportGedaPcb(c);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U1\" \"7486\"")) == 1);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U2\" \"7409\"")) == 1);
+        EXPECT(Count(pcb, wxT("Element(0x00 \"DIP14\" \"U3\" \"7432\"")) == 1);
+        EXPECT(Count(pcb, wxT("Element(")) == 3);
+
+        const wxString text = ExportGedaNetlist(c);
+        EXPECT(Count(text, wxT("GND\tU1-7 U2-7 U3-7 \n")) == 1);
+        EXPECT(Count(text, wxT("Vcc\tU1-14 U2-14 U3-14 \n")) == 1);
+    }
+
+    // ---- test 8: slots 3/4, the 7402 pinout, and the net/.pcb invariant ---
+    {
+        Circuit c;
+        for (int i = 0; i < 4; ++i)
+        {
+            AddComp(c, CT_Xor, i + 1, 10, 8 * i);
+            AddComp(c, CT_PinOut, 11 + i, 20, 8 * i);
+            AddWire(c, i + 1, 2, -1, -1, 14, 8 * i + 2, 20, 8 * i + 2);
+            AddWire(c, -1, -1, 11 + i, 0, 20, 8 * i + 2, 20, 8 * i + 1);
+        }
+        // 7402 puts its output first: pads 2/3 in, pad 1 out for slot 1.
+        AddComp(c, CT_Nor, 20, 10, 40);
+        AddComp(c, CT_PinIn,  21, 0, 40);
+        AddComp(c, CT_PinIn,  22, 0, 42);
+        AddComp(c, CT_PinOut, 23, 20, 40);
+        AddWire(c, 21, 0, 20, 0, 2, 41, 10, 41);
+        AddWire(c, 22, 0, 20, 1, 2, 43, 10, 43);
+        AddWire(c, 20, 2, -1, -1, 15, 42, 20, 42);
+        AddWire(c, -1, -1, 23, 0, 20, 42, 20, 41);
+
+        const wxString text = ExportGedaNetlist(c);
+        EXPECT(Count(text, wxT("U1-3 ")) == 1);    // XOR slot 1 out
+        EXPECT(Count(text, wxT("U1-6 ")) == 1);    // slot 2
+        EXPECT(Count(text, wxT("U1-8 ")) == 1);    // slot 3
+        EXPECT(Count(text, wxT("U1-11 ")) == 1);   // slot 4
+        EXPECT(Count(text, wxT("U2-1 ")) == 1);    // NOR out
+        EXPECT(Count(text, wxT("U2-2 ")) == 1);    // NOR in A
+        EXPECT(Count(text, wxT("U2-3 ")) == 1);    // NOR in B
+
+        const wxString pcb = ExportGedaPcb(c);
+        const std::vector<std::string> defined = PcbPins(pcb);
+        const std::vector<std::string> used = NetPins(text);
+        EXPECT(!used.empty());
+        int missing = 0;
+        for (const std::string& pin : used)
+            if (!Has(defined, pin)) ++missing;
+        EXPECT(missing == 0);
+        if (missing)
+            for (const std::string& pin : used)
+                if (!Has(defined, pin)) printf("pin not on board: %s\n", pin.c_str());
+    }
+
+    // ---- test 9: empty and sparse-id circuits -----------------------------
+    {
+        Circuit empty;
+        EXPECT(ExportGedaNetlist(empty).IsEmpty());
+        EXPECT(ExportGedaPcb(empty).IsEmpty());
+
+        // ids are not dense in a real project; numbering must not shift.
+        Circuit sparse;
+        AddComp(sparse, CT_Not, 100, 10, 0);
+        EXPECT(Count(ExportGedaPcb(sparse), wxT("\"U1\" \"7404\"")) == 1);
     }
 
     if (g_fail == 0) printf("netlist test: ALL OK\n");
