@@ -1014,23 +1014,148 @@ namespace
         long long slant    = 0;
         long long dots     = 0;
         long long overlap  = 0;
+        long long body     = 0;   // legs running through a component body
+        long long side     = 0;   // wire leaving a pin from the wrong side
         long long lostBend = 0;
         long long len      = 0;
         long long segs     = 0;
         long long choice   = 0;
 
+        // NOTE the ranking: every ELECTRICAL term (topo, slant, dots, overlap)
+        // is compared before the VISUAL ones (body, side).  A candidate that
+        // would invent one junction dot can never beat a dot-free candidate,
+        // however pretty it looks -- trading electrical safety for looks is
+        // exactly what broke wire dragging once before.
         bool operator<(const MoveScore& o) const
         {
             if (topo     != o.topo)     return topo     < o.topo;
             if (slant    != o.slant)    return slant    < o.slant;
             if (dots     != o.dots)     return dots     < o.dots;
             if (overlap  != o.overlap)  return overlap  < o.overlap;
+            if (body     != o.body)     return body     < o.body;
+            if (side     != o.side)     return side     < o.side;
             if (lostBend != o.lostBend) return lostBend < o.lostBend;
             if (len      != o.len)      return len      < o.len;
             if (segs     != o.segs)     return segs     < o.segs;
             return choice < o.choice;
         }
     };
+
+    // Does the neighbour of a pin lie on the side the wire must LEAVE to?
+    // WN_LEFT means the wire runs at x-1 relative to the pin `a`.
+    bool wnSideOk(wnSide side, const wxPoint& pin, const wxPoint& neighbour)
+    {
+        switch (side)
+        {
+            case WN_ANY:   return true;
+            case WN_H:     return pin.y == neighbour.y;
+            case WN_V:     return pin.x == neighbour.x;
+            case WN_LEFT:  return neighbour.x < pin.x;
+            case WN_RIGHT: return neighbour.x > pin.x;
+            case WN_UP:    return neighbour.y < pin.y;
+            case WN_DOWN:  return neighbour.y > pin.y;
+        }
+        return true;
+    }
+
+    // A pin sits ON the edge of its own body.  A leg that doubles back into
+    // the box still conducts but looks unplugged, so the repair prefers not
+    // to draw it.  Only the INTERIOR counts: running along an edge is fine,
+    // and the two pin points themselves are edge points by construction.
+    bool wnCrossesBody(const wxPoint& a, const wxPoint& b, const wnRect& r)
+    {
+        if (r.Empty()) return false;
+        if (a.y == b.y)
+        {
+            if (a.y <= r.y0 || a.y >= r.y1) return false;
+            const int lo = std::min(a.x, b.x), hi = std::max(a.x, b.x);
+            return lo < r.x1 && hi > r.x0;
+        }
+        if (a.x == b.x)
+        {
+            if (a.x <= r.x0 || a.x >= r.x1) return false;
+            const int lo = std::min(a.y, b.y), hi = std::max(a.y, b.y);
+            return lo < r.y1 && hi > r.y0;
+        }
+        return false;   // slanted legs are penalised separately
+    }
+
+    // Direct elbow/Z routes between the two ends.  The stretch candidates can
+    // only reshuffle the OLD skeleton, so when a drag moved a pin so far that
+    // the old bends are stale, no reshuffle can re-enter the pin from its
+    // correct side -- only a fresh elbow can.  The family is geometry-only:
+    // every vertical and horizontal corridor between the ends (and a little
+    // beyond them), plus the two L shapes at the ends of each range.  The
+    // electrical scoring in wnChooseMovePaths is what keeps them honest.
+    std::vector<std::vector<wxPoint>> wnElbowCandidates(const wxPoint& na,
+                                                        const wxPoint& nb,
+                                                        int K)
+    {
+        std::vector<std::vector<wxPoint>> out;
+        if (na == nb) return out;
+        if (K < 1) K = 1;
+
+        auto add = [&](const std::vector<wxPoint>& p)
+        {
+            if (p.size() < 2) return;
+            for (size_t i = 0; i + 1 < p.size(); ++i)
+            {
+                if (p[i] == p[i + 1]) return;
+                if (p[i].x != p[i + 1].x && p[i].y != p[i + 1].y) return;
+            }
+            for (size_t i = 0; i < out.size(); ++i)
+                if (out[i] == p) return;
+            out.push_back(p);
+        };
+
+        // Keep the family small even for a long run: a corridor worth having
+        // is near one of the two ends.
+        auto span = [](int a, int b, int k) -> std::vector<int>
+        {
+            std::vector<int> v;
+            const int lo = std::min(a, b), hi = std::max(a, b);
+            if (hi - lo + 1 <= 2 * k + 12)
+            {
+                for (int c = lo - k; c <= hi + k; ++c) v.push_back(c);
+            }
+            else
+            {
+                for (int c = lo - k; c <= lo + k; ++c) v.push_back(c);
+                for (int c = hi - k; c <= hi + k; ++c) v.push_back(c);
+            }
+            return v;
+        };
+
+        if (na.y != nb.y)
+        {
+            const std::vector<int> cols = span(na.x, nb.x, K);
+            for (size_t i = 0; i < cols.size(); ++i)
+            {
+                const int c = cols[i];
+                std::vector<wxPoint> p;
+                p.push_back(na);
+                if (c != na.x) p.push_back(wxPoint(c, na.y));
+                if (wxPoint(c, nb.y) != nb) p.push_back(wxPoint(c, nb.y));
+                p.push_back(nb);
+                add(p);
+            }
+        }
+        if (na.x != nb.x)
+        {
+            const std::vector<int> rows = span(na.y, nb.y, K);
+            for (size_t i = 0; i < rows.size(); ++i)
+            {
+                const int r = rows[i];
+                std::vector<wxPoint> p;
+                p.push_back(na);
+                if (r != na.y) p.push_back(wxPoint(na.x, r));
+                if (wxPoint(nb.x, r) != nb) p.push_back(wxPoint(nb.x, r));
+                p.push_back(nb);
+                add(p);
+            }
+        }
+        return out;
+    }
 
     // Per-port "who am I tied to" table.  Unlike a binary equality test this
     // gives the search a gradient, so it can climb out of a candidate that
@@ -1101,7 +1226,8 @@ std::vector<std::vector<wxPoint>> wnChooseMovePaths(
     const std::vector<wxPoint>& beforePorts,
     const std::vector<wxPoint>& afterPorts,
     const std::vector<wxPoint>& junctionPos,
-    int maxOffset)
+    int maxOffset,
+    const std::vector<wnRect>& blocks)
 {
     std::vector<std::vector<std::vector<wxPoint>>> cands(runs.size());
     for (size_t u = 0; u < runs.size(); ++u)
@@ -1113,8 +1239,16 @@ std::vector<std::vector<wxPoint>> wnChooseMovePaths(
         if (maxOffset < 0)
             all.push_back(wnStretchRun(runs[u].pts, runs[u].na, runs[u].nb, 0));
         else
+        {
             all = wnStretchCandidates(runs[u].pts, runs[u].na, runs[u].nb,
                                       maxOffset);
+            // Fresh elbows between the two ends: the only family that can
+            // re-enter a far-moved pin from its correct side, because the
+            // stretches above are all reshuffles of a now-stale skeleton.
+            const std::vector<std::vector<wxPoint>> elbows =
+                wnElbowCandidates(runs[u].na, runs[u].nb, maxOffset);
+            for (size_t e = 0; e < elbows.size(); ++e) all.push_back(elbows[e]);
+        }
 
         for (size_t k = 0; k < all.size(); ++k)
         {
@@ -1149,6 +1283,19 @@ std::vector<std::vector<wxPoint>> wnChooseMovePaths(
             const std::vector<wxPoint>& p = cands[u][(size_t)choice[u]];
             for (size_t k = 0; k + 1 < p.size(); ++k)
                 if (!(p[k] == p[k+1])) polys.push_back(Seg(p[k], p[k+1]));
+
+            // Visual terms -- strictly softer than every electrical term
+            // above, so they can only choose BETWEEN electrically equal
+            // candidates, never over an electrically cleaner one.
+            for (size_t k = 0; k + 1 < p.size(); ++k)
+                for (size_t r = 0; r < blocks.size(); ++r)
+                    if (wnCrossesBody(p[k], p[k+1], blocks[r])) ++s.body;
+            if (p.size() >= 2)
+            {
+                if (!wnSideOk(runs[u].headSide, p[0], p[1])) ++s.side;
+                if (!wnSideOk(runs[u].tailSide,
+                              p[p.size()-1], p[p.size()-2])) ++s.side;
+            }
 
             // Among electrically equivalent geometries, keep the bends the
             // user actually drew rather than silently straightening a run.
@@ -1191,7 +1338,8 @@ std::vector<std::vector<wxPoint>> wnChooseMovePaths(
         for (int round = 0; round < 3 && budget > 0; ++round)
         {
             if (best.topo == 0 && best.slant == 0 &&
-                best.dots == 0 && best.overlap == 0) break;
+                best.dots == 0 && best.overlap == 0 &&
+                best.body == 0 && best.side == 0) break;
 
             bool improved = false;
             for (size_t u = 0; u < runs.size() && budget > 0; ++u)
@@ -1199,7 +1347,8 @@ std::vector<std::vector<wxPoint>> wnChooseMovePaths(
                 // Stop as soon as a fully clean geometry is reached; there is
                 // no reason to keep scanning the remaining runs this round.
                 if (best.topo == 0 && best.slant == 0 &&
-                    best.dots == 0 && best.overlap == 0) break;
+                    best.dots == 0 && best.overlap == 0 &&
+                    best.body == 0 && best.side == 0) break;
 
                 int localBest = choice[u];
                 MoveScore localScore = best;

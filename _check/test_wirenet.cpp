@@ -968,6 +968,256 @@ static void TestAvoidanceCaseB()
           "B negative control: disabling avoidance reproduces the bug", "");
 }
 
+// ---------------------------------------------------------------------------
+// Pin exit + component-body avoidance.
+//
+// C:\Users\34854\Desktop\电路1.circ -> 电路2.circ (2026-11-19):
+// COMP 17 PIN_IN moves (3,4) -> (9,15).  Its output pin lands on (11,16), the
+// right edge of the body, but the saved wire ran LEFT from the pin, straight
+// through the body: electrically perfect, visually unplugged.
+//
+// A first attempt at fixing this ranked body/side ABOVE the electrical terms
+// and fed the router other wires as walls -- dragging a wire then produced
+// broken connections all over the canvas.  The rules here are the conservative
+// ones: body/side are SOFT terms ranked after dots/overlap, wires are never
+// walls, and a fresh "elbow" family between the two ends is what lets the
+// search re-enter the far-moved pin from its correct side.
+// ---------------------------------------------------------------------------
+
+static bool PinSideOk(wnSide side, const wxPoint& pin, const wxPoint& next)
+{
+    switch (side)
+    {
+        case WN_ANY:   return true;
+        case WN_H:     return pin.y == next.y;
+        case WN_V:     return pin.x == next.x;
+        case WN_LEFT:  return next.x < pin.x;
+        case WN_RIGHT: return next.x > pin.x;
+        case WN_UP:    return next.y < pin.y;
+        case WN_DOWN:  return next.y > pin.y;
+    }
+    return true;
+}
+
+static int BodyHits(const std::vector<wxPoint>& path,
+                    const std::vector<wnRect>& blocks)
+{
+    int n = 0;
+    for (size_t k = 0; k + 1 < path.size(); ++k)
+    {
+        const wxPoint a = path[k], b = path[k + 1];
+        for (size_t r = 0; r < blocks.size(); ++r)
+        {
+            const wnRect& q = blocks[r];
+            if (q.Empty()) continue;
+            if (a.y == b.y)
+            {
+                if (a.y <= q.y0 || a.y >= q.y1) continue;
+                const int lo = std::min(a.x, b.x), hi = std::max(a.x, b.x);
+                if (lo < q.x1 && hi > q.x0) ++n;
+            }
+            else if (a.x == b.x)
+            {
+                if (a.x <= q.x0 || a.x >= q.x1) continue;
+                const int lo = std::min(a.y, b.y), hi = std::max(a.y, b.y);
+                if (lo < q.y1 && hi > q.y0) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+static wnRect Box(int x0, int y0, int x1, int y1)
+{
+    wnRect r;
+    r.x0 = x0; r.y0 = y0; r.x1 = x1; r.y1 = y1;
+    return r;
+}
+
+static void TestPinExitAndBody()
+{
+    // 电路1.circ group 14: the run that follows the dragged PIN_IN.
+    const std::vector<wxPoint> g14 = Run({wxPoint(5,5), wxPoint(9,5),
+                                          wxPoint(9,7), wxPoint(14,7)});
+    const wxPoint na(11,16), nb(14,7);      // comp 17's port followed the drag
+
+    // Ambient: groups 15..17, untouched by the drag (电路2.circ WIRE 10..15).
+    std::vector<std::vector<wxPoint>> amb;
+    amb.push_back(Seg(7,8, 11,8));   amb.push_back(Seg(11,8, 12,8));
+    amb.push_back(Seg(12,8, 12,5));  amb.push_back(Seg(12,5, 14,5));
+    amb.push_back(Seg(12,8, 12,13)); amb.push_back(Seg(12,13, 15,13));
+
+    std::vector<std::vector<wxPoint>> before = amb;
+    before.push_back(Seg(5,5, 9,5));
+    before.push_back(Seg(9,5, 9,7));
+    before.push_back(Seg(9,7, 14,7));
+
+    // What the editor actually saved: leaves the pin LEFT, through the body.
+    std::vector<std::vector<wxPoint>> buggy = amb;
+    buggy.push_back(Seg(11,16, 9,16));
+    buggy.push_back(Seg(9,16, 9,7));
+    buggy.push_back(Seg(9,7, 14,7));
+
+    // Ports: 0=PIN17 out (moved), 1=PIN18 out, 2/3=AND19 in, 4=AND19 out,
+    // 5/6=AND20 in, 7=AND20 out.
+    std::vector<wxPoint> bp, ap;
+    const int bx[8] = {5, 7, 14, 14, 16, 15, 15, 17};
+    const int by[8] = {5, 8, 5, 7, 6, 13, 15, 14};
+    for (int i = 0; i < 8; ++i)
+    { bp.push_back(wxPoint(bx[i], by[i])); ap.push_back(wxPoint(bx[i], by[i])); }
+    ap[0] = wxPoint(11,16);                 // only comp 17 moved
+
+    std::vector<wnRect> blocks;
+    blocks.push_back(Box(9,15, 11,17));     // PIN_IN 17 (moved)
+    blocks.push_back(Box(5,7,  7,9));       // PIN_IN 18
+    blocks.push_back(Box(14,4, 16,8));      // AND 19
+    blocks.push_back(Box(15,12,17,16));     // AND 20
+
+    const std::vector<std::vector<int>> want = wnPortGroups(before, bp);
+
+    // The saved geometry is electrically perfect -- this bug is VISUAL only,
+    // so only soft terms can (and must) fix it.
+    Check(wnPortGroups(buggy, ap) == want,
+          "pin-exit: the saved wire keeps the topology", "");
+    Check(wnJunctionCount(buggy) == wnJunctionCount(before),
+          "pin-exit: the saved wire paints no extra dot", "");
+    Check(BodyHits(Run({wxPoint(11,16), wxPoint(9,16), wxPoint(9,7),
+                        wxPoint(14,7)}), blocks) >= 1,
+          "pin-exit: the saved wire crosses its own body", "");
+
+    // Negative control: without sides/blocks the stretch IS the saved bug.
+    // (Verified 2026-11-19: the pre-fix pipeline picks exactly this path.)
+    wnMoveRun loose;
+    loose.pts = g14; loose.na = na; loose.nb = nb;
+    const std::vector<wnMoveRun> looseRuns(1, loose);
+    const std::vector<std::vector<wxPoint>> noGuard =
+        wnChooseMovePaths(looseRuns, amb, before, bp, ap,
+                          std::vector<wxPoint>(), 3);
+    Check(!PinSideOk(WN_RIGHT, noGuard[0][0], noGuard[0][1]) &&
+          BodyHits(noGuard[0], blocks) >= 1,
+          "pin-exit: negative control reproduces the bug", Dump(noGuard[0]));
+
+    // The router candidate: body-free and side-correct but ELECTRICALLY
+    // shorted by the x=12 column -- if the visual terms ever rank above the
+    // electrical ones, this is the candidate that wins and breaks the net.
+    std::vector<wxPoint> router;
+    wnRouteAvoid(na, nb, WN_RIGHT, WN_LEFT, blocks, router);
+    Check(wnPortGroups(Flatten(amb, std::vector<std::vector<wxPoint>>(1, router)),
+                       ap) != want,
+          "pin-exit: the router candidate shorts two nets", Dump(router));
+
+    // The real call, exactly as the canvas makes it.
+    wnMoveRun run;
+    run.pts = g14; run.na = na; run.nb = nb; run.router = router;
+    run.headSide = WN_RIGHT;               // PIN_IN output drives right
+    run.tailSide = WN_LEFT;                // AND input is fed from the left
+    const std::vector<wnMoveRun> runs(1, run);
+    const std::vector<std::vector<wxPoint>> chosen =
+        wnChooseMovePaths(runs, amb, before, bp, ap,
+                          std::vector<wxPoint>(), 3, blocks);
+    const std::vector<wxPoint>& p = chosen[0];
+    const std::vector<std::vector<wxPoint>> after = Flatten(amb, chosen);
+
+    Check(wnPortGroups(after, ap) == want,
+          "pin-exit: repaired wire keeps the topology", Dump(p));
+    Check(wnJunctionCount(after) == wnJunctionCount(before),
+          "pin-exit: repaired wire paints no extra dot", Dump(p));
+    Check(SlantCount(after) == 0, "pin-exit: repaired wire is orthogonal", "");
+    Check(p != router,
+          "pin-exit: the shorted router candidate is rejected", Dump(p));
+    Check(PinSideOk(WN_RIGHT, p[0], p[1]),
+          "pin-exit: wire leaves the output pin on the RIGHT", Dump(p));
+    Check(PinSideOk(WN_LEFT, p[p.size()-1], p[p.size()-2]),
+          "pin-exit: wire enters the gate input from the LEFT", Dump(p));
+    Check(BodyHits(p, blocks) == 0,
+          "pin-exit: wire crosses no component body", Dump(p));
+
+    // Ranking guard: dots/overlap must decide BEFORE body/side.  Kill the
+    // clean corridor (a wire on x=13) so every body-free candidate is
+    // electrically dirty; the body-crossing stretch must then win again,
+    // because a wire through a body still conducts while a shorted one does
+    // not.
+    std::vector<std::vector<wxPoint>> ambBlocked = amb;
+    ambBlocked.push_back(Seg(13,9, 13,12));        // wall off the x=13 corridor
+    std::vector<std::vector<wxPoint>> beforeBlocked = before;
+    beforeBlocked.push_back(Seg(13,9, 13,12));
+    const std::vector<std::vector<wxPoint>> chosenBlocked =
+        wnChooseMovePaths(runs, ambBlocked, beforeBlocked, bp, ap,
+                          std::vector<wxPoint>(), 3, blocks);
+    const std::vector<wxPoint>& q = chosenBlocked[0];
+    const std::vector<std::vector<wxPoint>> afterBlocked =
+        Flatten(ambBlocked, chosenBlocked);
+    Check(wnPortGroups(afterBlocked, ap) == want,
+          "pin-exit(ranked): electrical cleanliness wins over looks", Dump(q));
+    Check(wnJunctionCount(afterBlocked) ==
+              wnJunctionCount(Flatten(ambBlocked,
+                                      std::vector<std::vector<wxPoint>>())),
+          "pin-exit(ranked): no extra dot when the corridor is walled", "");
+}
+
+// ---------------------------------------------------------------------------
+// Wire dragging must not detour around other wires.
+//
+// The rejected fix fed the router every existing wire as a WALL; a branch
+// hanging on the dragged wire then had to reach its (moved) anchor through a
+// maze of stale obstacles and came out broken.  Wires are not walls: a branch
+// re-lays straight onto the dragged wire's new position, keeps exactly one
+// junction dot, and a plain crossing stays a plain crossing.
+// ---------------------------------------------------------------------------
+
+static void TestWireDragBranch()
+{
+    // W1 (2,4)-(8,4) is dragged up by 3 -> (2,1)-(8,1).  Branch B hangs on
+    // its middle at (5,4) and must follow to (5,1).  B's lower end is PIN's
+    // output port at (5,9); W2 is crossed plainly at (5,8) and must STAY a
+    // plain crossing (P1 at (9,8) must not join P0's net).
+    std::vector<std::vector<wxPoint>> amb;
+    amb.push_back(Seg(2,1, 8,1));      // W1 at its new (dragged) position
+    amb.push_back(Seg(4,8, 9,8));      // W2
+
+    std::vector<std::vector<wxPoint>> before;
+    before.push_back(Seg(2,4, 8,4));   // W1 before the drag
+    before.push_back(Seg(5,4, 5,9));   // branch B
+    before.push_back(Seg(4,8, 9,8));   // W2
+
+    std::vector<wxPoint> bp, ap;
+    bp.push_back(wxPoint(5,9));  ap.push_back(wxPoint(5,9));   // 0: PIN out
+    bp.push_back(wxPoint(9,8));  ap.push_back(wxPoint(9,8));   // 1: W2's port
+    const std::vector<std::vector<int>> want = wnPortGroups(before, bp);
+    Check(want.size() == 2,
+          "wire-drag: two separate nets before the drag", "");
+
+    std::vector<wnRect> blocks;
+    blocks.push_back(Box(3,8, 5,10));   // PIN feeding the branch
+    blocks.push_back(Box(9,6, 11,10));  // gate fed by W2
+
+    wnMoveRun run;
+    run.pts = Run({wxPoint(5,4), wxPoint(5,9)});   // B, head on the wire
+    run.na  = wxPoint(5,1);                        // follows the dragged wire
+    run.nb  = wxPoint(5,9);                        // port end did not move
+    run.tailSide = WN_RIGHT;                       // PIN output drives right
+    const std::vector<wnMoveRun> runs(1, run);
+
+    const std::vector<std::vector<wxPoint>> chosen =
+        wnChooseMovePaths(runs, amb, before, bp, ap,
+                          std::vector<wxPoint>(), 3, blocks);
+    const std::vector<wxPoint>& p = chosen[0];
+    const std::vector<std::vector<wxPoint>> after = Flatten(amb, chosen);
+
+    Check(wnPortGroups(after, ap) == want,
+          "wire-drag: branch stays in its own net", Dump(p));
+    Check(wnJunctionCount(after) == wnJunctionCount(before),
+          "wire-drag: exactly one junction dot, on the new position", Dump(p));
+    Check(SlantCount(after) == 0, "wire-drag: branch is orthogonal", "");
+    Check(p.front() == wxPoint(5,1) && p.back() == wxPoint(5,9),
+          "wire-drag: branch lands on the dragged wire and its pin", Dump(p));
+    bool straight = true;
+    for (size_t i = 0; i < p.size(); ++i)
+        if (p[i].x != 5) straight = false;
+    Check(straight,
+          "wire-drag: branch does not detour around the crossing wire", Dump(p));
+}
+
 int main()
 {
     TestNormalize();
@@ -984,6 +1234,8 @@ int main()
     TestStretchOrthogonality();
     TestAvoidanceCaseA();
     TestAvoidanceCaseB();
+    TestPinExitAndBody();
+    TestWireDragBranch();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

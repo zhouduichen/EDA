@@ -207,11 +207,17 @@ std::vector<std::vector<wxPoint>> wnStretchCandidates(
 
 // One run the drag repair has to re-lay.  `router` is the candidate the
 // ordinary router produced; an empty router means it is not available.
+// headSide / tailSide say which way the wire must LEAVE each end when that
+// end sits on a component pin: the pin owns an edge of its body, and a wire
+// doubling back through the body looks unplugged even though it conducts.
+// Both are SOFT constraints -- see wnChooseMovePaths.
 struct wnMoveRun
 {
     std::vector<wxPoint> pts;      // pre-drag skeleton, interior bends relocated
     wxPoint na, nb;                // where the two ends have to land
     std::vector<wxPoint> router;   // may be empty
+    wnSide headSide = WN_ANY;
+    wnSide tailSide = WN_ANY;
 };
 
 // Choose one orthogonal path per run.  `ambient` polylines are always present
@@ -219,10 +225,19 @@ struct wnMoveRun
 //
 // Each candidate geometry is measured with the SAME net extractor the canvas
 // draws with: port grouping must survive, no slanted segment may appear, no
-// extra junction dot or collinear overlap may be invented.  A coordinate
-// descent over the per-run candidate lists finds the least invasive geometry
-// that satisfies all of them; the search never silently accepts a candidate
-// that shorts two nets just because it is the last one tried.
+// extra junction dot or collinear overlap may be invented.  On top of that,
+// two SOFT terms rank every candidate that passes the electrical ones: a leg
+// running through a component body (`blocks`) and a wire leaving a pin from
+// its wrong side (headSide / tailSide).  They are strictly AFTER the
+// electrical terms, so the search never trades a junction dot or an overlap
+// for looks -- a wire may cross a body (it still conducts), but never at the
+// price of shorting two nets.
+//
+// The candidate set is the router path, every skeleton-preserving stretch of
+// the old run, and a family of direct elbow/Z routes between the two ends.
+// The elbows exist because a drag can move a pin so far that the old bends
+// are stale; no reshuffle of a stale skeleton can re-enter the pin from the
+// correct side, while a fresh elbow can.
 //
 // maxOffset < 0 disables the avoidance search (candidate 0 only), which is
 // what callers with a changing port set need.
@@ -233,7 +248,8 @@ std::vector<std::vector<wxPoint>> wnChooseMovePaths(
     const std::vector<wxPoint>& beforePorts,
     const std::vector<wxPoint>& afterPorts,
     const std::vector<wxPoint>& junctionPos,
-    int maxOffset = 3);
+    int maxOffset = 3,
+    const std::vector<wnRect>& blocks = std::vector<wnRect>());
 
 // ---------------------------------------------------------------------------
 // Move repair (Logisim "WireRepair")

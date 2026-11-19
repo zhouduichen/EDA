@@ -27,6 +27,25 @@ namespace
     // once is what keeps the router, the move repair and the end drag honest.
     wnSide PortSide(bool isOutput) { return isOutput ? WN_RIGHT : WN_LEFT; }
 
+    // Which way a wire must LEAVE a port, judged by the edge of the component
+    // body the port sits on: the wire runs outward, away from the body.  For
+    // the standard gates this agrees with PortSide(), but it is also right
+    // for sub-circuits and custom components whose ports sit on the top and
+    // bottom edges as well.
+    wnSide PortExitSide(const Component& c, const Port& p)
+    {
+        const int w = c.Width();
+        const int h = c.Height();
+        if (w > 0 && h > 0)
+        {
+            if (p.grid.x <= c.gridPos.x)     return WN_LEFT;
+            if (p.grid.x >= c.gridPos.x + w) return WN_RIGHT;
+            if (p.grid.y <= c.gridPos.y)     return WN_UP;
+            if (p.grid.y >= c.gridPos.y + h) return WN_DOWN;
+        }
+        return WN_ANY;   // interior port: no edge to leave from
+    }
+
     const double kPi = 3.14159265358979323846;
     struct DPt { double x, y; DPt(double X = 0, double Y = 0) : x(X), y(Y) {} };
 
@@ -1112,6 +1131,15 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
             if (dit != disp.end()) base[k] = dit->second;
         }
 
+        // Ports (and their bodies) the two ends are glued to.  They decide
+        // which side a re-laid run has to LEAVE each end from.
+        const Port* pa = (aComp >= 0) ? m_circuit->FindPort(aComp, aPort) : nullptr;
+        const Port* pb = (bComp >= 0) ? m_circuit->FindPort(bComp, bPort) : nullptr;
+        const Component* ca = (aComp >= 0) ? m_circuit->FindComponent(aComp) : nullptr;
+        const Component* cb = (bComp >= 0) ? m_circuit->FindComponent(bComp) : nullptr;
+        const wnSide headSide = (pa && ca) ? PortExitSide(*ca, *pa) : WN_ANY;
+        const wnSide tailSide = (pb && cb) ? PortExitSide(*cb, *pb) : WN_ANY;
+
         // Candidate 0: the ordinary router.  An end glued to a component pin
         // has to keep meeting it from the side, and the run has to walk around
         // the body instead of under it.
@@ -1141,16 +1169,13 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
             }
             way.push_back(nb);
 
-            const Port* pa = (aComp >= 0) ? m_circuit->FindPort(aComp, aPort) : nullptr;
-            const Port* pb = (bComp >= 0) ? m_circuit->FindPort(bComp, bPort) : nullptr;
-
             std::vector<wxPoint> path;
             wxPoint from    = na;
-            wnSide  curSide = pa ? PortSide(pa->isOutput) : WN_ANY;
+            wnSide  curSide = headSide;
             for (size_t k = 0; k < way.size(); ++k)
             {
                 const bool lastLeg = (k + 1 == way.size());
-                const wnSide endSide = lastLeg && pb ? PortSide(pb->isOutput) : WN_ANY;
+                const wnSide endSide = lastLeg ? tailSide : WN_ANY;
                 std::vector<wxPoint> leg;
                 wnRouteAvoid(from, way[k], curSide, endSide, blocks, leg);
                 wnJoinRun(path, leg);
@@ -1168,10 +1193,12 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
         }
 
         wnMoveRun r;
-        r.pts    = base;
-        r.na     = na;
-        r.nb     = nb;
-        r.router = routerPath;
+        r.pts      = base;
+        r.na       = na;
+        r.nb       = nb;
+        r.router   = routerPath;
+        r.headSide = headSide;      // leaving the far-moved pin from its
+        r.tailSide = tailSide;      // body edge looks plugged in
         moveRuns.push_back(r);
 
         RunEmit e;
@@ -1195,7 +1222,7 @@ void CircuitCanvas::RepairWiresForMove(const wxPoint& delta)
     const std::vector<std::vector<wxPoint>> chosen =
         wnChooseMovePaths(moveRuns, ambient, beforeSegs, beforePorts,
                           afterPorts, m_junctionSnapshot,
-                          portSetStable ? 3 : -1);
+                          portSetStable ? 3 : -1, blocks);
 
     for (size_t u = 0; u < chosen.size(); ++u)
     {
