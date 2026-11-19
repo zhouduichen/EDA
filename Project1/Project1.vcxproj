@@ -72,7 +72,12 @@
   <PropertyGroup Label="UserMacros" />
 
   <PropertyGroup>
-    <WX_ROOT>F:\EDA\basic\basic_tools\wxWidgets-3.2.2.1</WX_ROOT>
+    <!-- wxWidgets 3.2.2.1 tree: taken from the WXWIN environment variable
+         when it is set (the variable wxWidgets itself documents); otherwise
+         a plain default that matches a stock unpack of 3.2.2.1.  Set WXWIN
+         before opening the solution if your copy lives elsewhere. -->
+    <WX_ROOT Condition="'$(WXWIN)' != ''">$(WXWIN)</WX_ROOT>
+    <WX_ROOT Condition="'$(WXWIN)' == ''">C:\wxWidgets-3.2.2.1</WX_ROOT>
   </PropertyGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">

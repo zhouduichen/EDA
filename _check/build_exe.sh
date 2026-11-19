@@ -10,25 +10,24 @@ set -u
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
-VS='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231'
-BIN="$VS\\bin\\Hostx64\\x64"
-MSVCINC="$VS\\include"
-MSVCLIB="$VS\\lib\\x64"
-KIT='D:\Windows Kits\10'
-SDKV='10.0.26100.0'
-RC="$KIT\\bin\\${SDKV}\\x64\\rc.exe"     # the resource compiler lives in the SDK
+# Toolchain (VS/SDK via vswhere, wxWidgets via WXWIN or env.local.sh):
+# see env.sh.  Sourced, not executed, so it may not use `exit`.
+. "$(dirname "$0")/env.sh"
+
+BLD="$CHK\\build"
+EXE="$BLD\\LogicSim.exe"
+# Optional convenience: drop a copy on a desktop directory of your choice
+# (set DESK=... in _check/env.local.sh).
+DESK="${DESK:-}"
+
+mkdir -p "$BLD"
+# EXE is a Windows-style path; rm needs the POSIX form (MSYS_NO_PATHCONV=1
+# above deliberately disables automatic conversion for cl/link arguments).
+# Without this a failed relink could leave a stale exe behind.
+rm -f "$(cygpath -u "$EXE")"
 # link.exe shells out to rc.exe when it embeds the manifest, so it must be
 # reachable through PATH.
-export PATH="/c/Program Files (x86)/Windows Kits/10/bin/${SDKV}/x64:$PATH"
-WX='C:\wxWidgets-3.2.2.1'
-SRC='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\Project1'
-CHK='F:\EDA\wxWidgets_project\_check'
-OUT="$CHK\\build"
-DESK='C:\Users\34854\Desktop'
-EXE="$DESK\\LogicSim.exe"
-
-mkdir -p "$OUT"
-rm -f "$EXE"
+export PATH="$(cygpath -u "$KIT")/bin/$SDKV/x64:$PATH"
 
 # NB: every /I must stay one quoted argument -- these paths contain spaces.
 INC=("/I$WX\\include" "/I$WX\\include\\msvc" "/I$MSVCINC"
@@ -42,16 +41,16 @@ echo "--- resources ---"
 RCINC=("/I$WX\\include" "/I$WX\\include\\msvc"
        "/I$KIT\\Include\\${SDKV}\\um" "/I$KIT\\Include\\${SDKV}\\shared"
        "/I$KIT\\Include\\${SDKV}\\ucrt")
-"$RC" /nologo /D_UNICODE /DUNICODE "${RCINC[@]}" /fo"$OUT\\app.res" "$CHK\\app.rc"
+"$RC" /nologo /D_UNICODE /DUNICODE "${RCINC[@]}" /fo"$BLD\\app.res" "$CHK\\app.rc"
 if [ $? -ne 0 ]; then echo "rc failed"; exit 1; fi
 
 # ------------------------------------------------------------------ compile
 echo "--- compile ---"
 "$BIN\\cl.exe" /nologo /c /EHsc /std:c++20 /utf-8 /W3 /O2 /Zc:__cplusplus \
   /D_UNICODE /DUNICODE /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS \
-  /D_DEBUG /MDd "${INC[@]}" /Fo"$OUT\\" \
+  /D_DEBUG /MDd "${INC[@]}" /Fo"$BLD\\" \
   "$SRC\\main.cpp" "$SRC\\mainframe.cpp" "$SRC\\canvas.cpp" \
-  "$SRC\\model.cpp" "$SRC\\wirenet.cpp" "$SRC\\eda.cpp"
+  "$SRC\\model.cpp" "$SRC\\wirenet.cpp" "$SRC\\netlist.cpp" "$SRC\\eda.cpp"
 if [ $? -ne 0 ]; then echo "cl failed"; exit 1; fi
 
 # --------------------------------------------------------------------- link
@@ -61,8 +60,8 @@ echo "--- link ---"
   /LIBPATH:"$WX\\lib\\vc_x64_lib" /LIBPATH:"$MSVCLIB" \
   /LIBPATH:"$KIT\\Lib\\${SDKV}\\ucrt\\x64" /LIBPATH:"$KIT\\Lib\\${SDKV}\\um\\x64" \
   /OUT:"$EXE" \
-  "$OUT\\main.obj" "$OUT\\mainframe.obj" "$OUT\\canvas.obj" \
-  "$OUT\\model.obj" "$OUT\\wirenet.obj" "$OUT\\eda.obj" "$OUT\\app.res" \
+  "$BLD\\main.obj" "$BLD\\mainframe.obj" "$BLD\\canvas.obj" \
+  "$BLD\\model.obj" "$BLD\\wirenet.obj" "$BLD\\netlist.obj" "$BLD\\eda.obj" "$BLD\\app.res" \
   wxzlibd.lib wxtiffd.lib wxscintillad.lib wxregexud.lib wxpngd.lib wxmsw32ud_xrc.lib \
   wxmsw32ud_webview.lib wxmsw32ud_stc.lib wxmsw32ud_richtext.lib wxmsw32ud_ribbon.lib \
   wxmsw32ud_qa.lib wxmsw32ud_propgrid.lib wxmsw32ud_media.lib wxmsw32ud_html.lib \
@@ -74,3 +73,7 @@ echo "--- link ---"
 if [ $? -ne 0 ]; then echo "link failed"; exit 1; fi
 
 ls -la "$EXE"
+if [ -n "$DESK" ]; then
+    cp -f "$(cygpath -u "$EXE")" "$(cygpath -u "$DESK")/LogicSim.exe" \
+        && echo "copied to $(cygpath -u "$DESK")/LogicSim.exe"
+fi

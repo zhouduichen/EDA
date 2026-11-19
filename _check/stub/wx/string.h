@@ -34,14 +34,53 @@ public:
     wxChar  operator[](size_t i) const { return s_[i]; }
     const wchar_t* c_str() const { return s_.c_str(); }
 
-    static wxString Format(const wxString& fmt, ...)
+    // MSVC 14.4x+ hard-errors on va_start() whose last named parameter is a
+    // reference (C standard UB).  Keep va_start on a plain pointer and let
+    // the public overloads forward to it, so both g++ and MSVC accept this
+    // header while every wxString::Format(wxT("..."), ...) call is unchanged.
+    static wxString FormatV(const wchar_t* fmt, ...)
     {
+        // Real wxString::Format() treats %s as a wide string.  In the C
+        // library's vswprintf() that specifier is %ls on glibc (MSVC/MinGW
+        // happen to accept %s too), so normalise it before formatting.  All
+        // string arguments this project passes are wchar_t*.
+        std::wstring normalized;
+        for (size_t i = 0; i < std::wcslen(fmt); ++i)
+        {
+            if (fmt[i] == L'%' && fmt[i + 1] == L'%')
+            {
+                normalized += L"%%";
+                ++i;
+            }
+            else if (fmt[i] == L'%' && fmt[i + 1] == L's')
+            {
+                normalized += L"%ls";
+                ++i;
+            }
+            else
+            {
+                normalized += fmt[i];
+            }
+        }
+
         va_list ap;
         va_start(ap, fmt);
         wchar_t buf[1024];
-        vswprintf(buf, 1024, fmt.c_str(), ap);
+        std::vswprintf(buf, 1024, normalized.c_str(), ap);
         va_end(ap);
         return wxString(buf);
+    }
+
+    template <class... Args>
+    static wxString Format(const wchar_t* fmt, Args... args)
+    {
+        return FormatV(fmt, args...);
+    }
+
+    template <class... Args>
+    static wxString Format(const wxString& fmt, Args... args)
+    {
+        return FormatV(fmt.c_str(), args...);
     }
 
     wxString& Trim(bool fromRight = true)

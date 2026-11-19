@@ -3,8 +3,8 @@
 #
 # This check needs no wxWidgets and no MSVC: model.h / netlist.cpp / wirenet.cpp
 # are compiled against the minimal stub headers in stub/wx, so any machine with
-# a C++ compiler can run it.  (The other *_check.sh scripts in this folder still
-# hard-code paths from the machine they were written on -- see README.)
+# a C++ compiler can run it.  The MSVC-based *_check.sh scripts get their
+# toolchain paths from env.sh (VS/SDK autodetection, wxWidgets via WXWIN).
 set -eu
 cd "$(dirname "$0")"
 

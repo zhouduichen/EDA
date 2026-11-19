@@ -3,13 +3,19 @@
 set -u
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
+# Toolchain (VS/SDK via vswhere, wxWidgets via WXWIN or env.local.sh):
+# see env.sh.  Sourced, not executed, so it may not use `exit`.
+. "$(dirname "$0")/env.sh"
+cd "$(dirname "$0")"
+# link_check consumes the objects produced by compile_check.sh; refuse to
+# link a stale set.
+for o in main mainframe canvas model wirenet netlist eda; do
+  if [ ! -f "obj/$o.obj" ]; then
+    echo "missing obj/$o.obj -- run compile_check.sh first" >&2
+    exit 1
+  fi
+done
 
-BIN='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64'
-MSVCLIB='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\lib\x64'
-KIT='D:\Windows Kits\10'
-SDKV='10.0.26100.0'
-WX='C:\wxWidgets-3.2.2.1'
-OUT='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\_check\obj'
 
 "$BIN\link.exe" /nologo /SUBSYSTEM:WINDOWS /MACHINE:X64 /DEBUG \
   /LIBPATH:"$WX\\lib\\vc_x64_lib" \
@@ -27,4 +33,6 @@ OUT='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1
   kernel32.lib user32.lib gdi32.lib comdlg32.lib comctl32.lib shell32.lib \
   ole32.lib oleaut32.lib uuid.lib advapi32.lib winspool.lib shlwapi.lib version.lib
 
-echo "exit=$?"
+rc=$?
+echo "exit=$rc"
+exit "$rc"

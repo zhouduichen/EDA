@@ -1,0 +1,111 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Prove that a fresh clone can be built on a machine that has never seen
+  # this project: no committed exe, no wxWidgets tree, no local path tweaks.
+  windows-msvc:
+    name: Windows / MSVC x64 / CMake
+    runs-on: windows-latest
+    env:
+      WX_TAG: v3.2.2.1
+      WXWIN: ${{ github.workspace }}\wx
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache wxWidgets 3.2.2.1 prebuilt tree
+        id: wx
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/wx
+          key: wxmsw-3.2.2.1-vc14x-x64-dev-v1
+
+      - name: Download wxWidgets 3.2.2.1 prebuilt packages
+        if: steps.wx.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = "https://github.com/wxWidgets/wxWidgets/releases/download/$env:WX_TAG"
+          # The Dev archive's version string is 3.2.2 (not 3.2.2.1).
+          $names = @(
+            'wxWidgets-3.2.2.1-headers.7z',
+            'wxMSW-3.2.2_vc14x_x64_Dev.7z',
+            'wxMSW-3.2.2_vc14x_x64_ReleaseDLL.7z'
+          )
+          New-Item -ItemType Directory -Force -Path 'dl' | Out-Null
+          foreach ($n in $names) {
+            Write-Host "downloading $n"
+            & curl.exe -fL --retry 3 --retry-delay 5 -o "dl/$n" "$base/$n"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $n" }
+          }
+
+      - name: Extract wxWidgets
+        if: steps.wx.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = 'C:\Program Files\7-Zip\7z.exe' }
+          if (-not (Test-Path $sevenZip)) { throw '7-Zip is not available on this runner' }
+          New-Item -ItemType Directory -Force -Path $env:WXWIN | Out-Null
+          Get-ChildItem 'dl' -Filter '*.7z' | ForEach-Object {
+            Write-Host "extracting $($_.Name)"
+            & $sevenZip x $_.FullName "-o$env:WXWIN" -y -bso0 -bsp0
+            if ($LASTEXITCODE -ne 0) { throw "extract failed: $($_.Name)" }
+          }
+          if (-not (Test-Path "$env:WXWIN\include\wx\wx.h")) {
+            throw "wxWidgets headers are missing after extraction"
+          }
+          if (Test-Path "$env:WXWIN\lib") {
+            Write-Host 'wxWidgets lib directories:'
+            Get-ChildItem "$env:WXWIN\lib" -Directory | Select-Object -ExpandProperty Name
+          }
+
+      - name: Configure (Debug, static wx libs)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Debug `
+            -DwxWidgets_ROOT_DIR="$env:WXWIN"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Debug --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Unit tests (ctest)
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Debug --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload LogicSim.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogicSim-windows-x64-debug
+          path: build/Debug/LogicSim.exe
+          if-no-files-found: error
+
+  # The GUI is Windows-only, but the geometry / netlist core is plain C++ and
+  # compiles against the minimal wx stub headers on any g++ toolchain.
+  core-tests-linux:
+    name: Linux / g++ / core logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wire geometry + net extraction (148 checks)
+        run: |
+          g++ -std=c++17 -I_check/stub -IProject1 \
+              _check/test_wirenet.cpp Project1/wirenet.cpp -o /tmp/test_wirenet
+          /tmp/test_wirenet
+
+      - name: gEDA netlist export
+        run: bash _check/netlist_check.sh

@@ -1,6 +1,9 @@
 # 数字逻辑电路（Digital Logic Circuit）
 
-类 Logisim 的数字逻辑电路绘制与仿真工具。基于 C++17 与 wxWidgets 3.2 开发，运行于 Windows（Visual Studio 2022，x64）。
+类 Logisim 的数字逻辑电路绘制与仿真工具。基于 C++20 与 wxWidgets 3.2.2.1 开发，运行于 Windows（Visual Studio 2022 / 2026，x64）。
+
+> 首次拉取仓库后的**完整构建步骤、依赖下载、CI 说明**见仓库根目录 [`README.md`](../README.md)。
+> 本文件只描述程序本身的功能、代码结构与设计约定。
 
 从左侧元件树选择逻辑门或引脚，在画布上单击放置；从引脚拖拽即可画线，导线实时正交走线；开启仿真后单击输入引脚切换电平，整条组合逻辑通路随之求值，导线按电平着色。
 
@@ -43,16 +46,26 @@
 
 ## 构建
 
-依赖：
+仓库不含可执行文件。推荐用根目录的 CMake 工程（见 [根 README](../README.md)）：
 
-- wxWidgets 3.2.x（本机路径 `F:\EDA\basic\basic_tools\wxWidgets-3.2.2.1`，见 `Project1.vcxproj` 中的 `WX_ROOT` 属性）
-- Visual Studio 2022（平台工具集 v145）与 Windows SDK 10，x64
-
-用 Visual Studio 打开 `Project1.slnx`，选择 `x64` + `Debug`/`Release` 生成并运行；也可以在开发者命令提示符中执行：
-
-```bash
-msbuild Project1.slnx /p:Configuration=Release /p:Platform=x64
+```bat
+set WXWIN=C:\wxWidgets-3.2.2.1
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
 ```
+
+也可以直接用本目录的 VS 工程：设置 `WXWIN`（`Project1.vcxproj` 的 `WX_ROOT`
+优先取该环境变量，未设置时回退到 `C:\wxWidgets-3.2.2.1`），打开 `Project1.slnx`，
+选择 `x64` + `Debug` 生成。工程默认平台工具集为 `v145`；若本机只有 `v143`：
+
+```bat
+msbuild Project1.slnx /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143
+```
+
+依赖：wxWidgets 3.2.2.1（官方预编译 `vc14x_x64` 开发包）、带「使用 C++ 的桌面开发」
+的 Visual Studio 与 Windows SDK 10。所有 `_check/*.sh` 脚本的工具链路径由
+`_check/env.sh` 自动探测，不再需要按机器修改。
 
 ## 代码结构
 
@@ -67,13 +80,20 @@ msbuild Project1.slnx /p:Configuration=Release /p:Platform=x64
 
 ## 测试与验证
 
-仓库根目录的 `_check/` 保存不依赖 GUI 交互的验证脚本（bash + MSVC）：
+仓库根目录的 `_check/` 保存不依赖 GUI 交互的验证脚本；工具链由 `_check/env.sh`
+自动探测（VS/SDK 用 `vswhere` + Windows Kits，wxWidgets 用 `WXWIN` 或本机
+`_check/env.local.sh`），脚本里没有硬编码路径：
 
-- `wirenet_check.sh`：编译并运行导线几何 / 建网模块的独立单元测试（依赖 MSVC + 本机 wxWidgets，脚本里的路径需按机器修改）
+- `wirenet_check.sh`：编译并运行导线几何 / 建网模块的独立单元测试（148 项断言，含拖动拓扑保护与引脚出线方向回归）
 - `netlist_check.sh`：网表构建 / gEDA 导出测试——走 `stub/wx` 桩 + 任意 g++，不需要 wxWidgets 与 MSVC，可直接运行；覆盖芯片分组、各封装引脚号、电源网，并校验 `.net` 里每个 `RefDes-引脚` 都能在 `.pcb` 中找到。导出格式逐行对照 `任务5参考/文件` 里的 gEDA 输出；本仓库环境未安装 gEDA pcb，未做 pcb 真机加载
-- `model_check.sh`：编译并运行模型层冒烟测试（仅依赖 wxBase，路径需按机器修改）
+- `model_check.sh`：编译并运行模型层冒烟测试（仅依赖 wxBase）
 - `compile_check.sh` / `link_check.sh`：完整 GUI 程序的编译 / 链接检查
-- `build_exe.sh`：以 Release 配置静态链接 wxWidgets，产出自包含可执行文件 `LogicSim.exe` 并放到桌面
+- `keybind_check.sh`：快捷键绑定一致性
+- `build_exe.sh`：直接调用 `cl.exe` / `rc.exe` / `link.exe`，以 debug 静态 wx 库（`/MDd`）产出 `_check/build/LogicSim.exe`；该产物依赖调试版 VC 运行库，仅适合开发机运行
+
+`cmake --build` 之后也可用 `ctest --test-dir build -C Debug --output-on-failure`
+一次跑完 4 个注册测试（wirenet / netlist / keybind / model）。GitHub Actions
+会在干净的 Windows 与 Ubuntu 环境里分别复现 CMake 构建与纯逻辑层测试。
 
 ## 工程文件格式
 

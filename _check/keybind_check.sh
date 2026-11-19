@@ -4,19 +4,13 @@
 set -eu
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
+# Toolchain (VS/SDK via vswhere, wxWidgets via WXWIN or env.local.sh):
+# see env.sh.  Sourced, not executed, so it may not use `exit`.
+. "$(dirname "$0")/env.sh"
 cd "$(dirname "$0")"
 
-VS='C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231'
-BIN="$VS\\bin\\Hostx64\\x64"
-MSVCINC="$VS\\include"
-MSVCLIB="$VS\\lib\\x64"
-KIT='C:\Program Files (x86)\Windows Kits\10'
-SDKV='10.0.26100.0'
-WX='F:\EDA\basic\basic_tools\wxWidgets-3.2.2.1'
-SRC='F:\EDA\wxWidgets_project\Project1'
-OUT='F:\EDA\wxWidgets_project\_check\obj'
 
-mkdir -p "$OUT"
+mkdir -p "$(cygpath -u "$OUT")"
 
 "$BIN\\cl.exe" /nologo /c /EHsc /std:c++20 /utf-8 /W3 \
   /D_UNICODE /DUNICODE /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /D_DEBUG /MDd \

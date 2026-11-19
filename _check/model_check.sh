@@ -1,19 +1,19 @@
 #!/bin/bash
 # Build + run the model layer smoke test (console app, wxBase only).
-set -u
+set -eu
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
+# test_model.cpp is referenced by a relative path below; see wirenet_check.sh
+# for why both the cd and set -e are required to avoid stale-object fake PASS.
+# Toolchain (VS/SDK via vswhere, wxWidgets via WXWIN or env.local.sh):
+# see env.sh.  Sourced, not executed, so it may not use `exit`.
+. "$(dirname "$0")/env.sh"
+cd "$(dirname "$0")"
 
-BIN='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64'
-MSVCINC='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\include'
-MSVCLIB='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\lib\x64'
-KIT='D:\Windows Kits\10'
-SDKV='10.0.26100.0'
-WX='C:\wxWidgets-3.2.2.1'
-SRC='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\Project1'
-OUT='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\_check\obj'
 
-mkdir -p "$OUT"
+mkdir -p "$(cygpath -u "$OUT")"
+# Never let a failed compile fall back to a previous build's objects.
+rm -f obj/model.obj obj/wirenet.obj obj/test_model.obj obj/test_model.exe
 
 "$BIN\cl.exe" /nologo /c /EHsc /std:c++20 /utf-8 /MDd /D_DEBUG /D_UNICODE /DUNICODE /D_CRT_SECURE_NO_WARNINGS \
   /I"$WX\include" /I"$WX\include\msvc" /I"$MSVCINC" \

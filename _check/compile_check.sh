@@ -4,18 +4,19 @@
 set -u
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
+# Toolchain (VS/SDK via vswhere, wxWidgets via WXWIN or env.local.sh):
+# see env.sh.  Sourced, not executed, so it may not use `exit`.
+. "$(dirname "$0")/env.sh"
+cd "$(dirname "$0")"
 
-CL='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\cl.exe'
-MSVCINC='D:\Visual Studio\Visual Studio 2026\Community\VC\Tools\MSVC\14.51.36231\include'
-KIT='D:\Windows Kits\10'
-SDKV='10.0.26100.0'
-WX='C:\wxWidgets-3.2.2.1'
-SRC='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\Project1'
-OUT='C:\Users\asus\Desktop\电子科技大学\EDA\HJH\CZW\EDA-wxwidgets-project1\_check\obj'
 
-mkdir -p "$OUT"
+mkdir -p "$(cygpath -u "$OUT")"
+# link_check.sh consumes these objects; clear them first so a failed compile
+# can never be papered over by linking a previous build's .obj files.
+rm -f obj/main.obj obj/mainframe.obj obj/canvas.obj obj/model.obj \
+      obj/wirenet.obj obj/netlist.obj obj/eda.obj
 
-"$CL" /nologo /c /EHsc /std:c++20 /utf-8 /W3 /Zc:__cplusplus \
+"$BIN\\cl.exe" /nologo /c /EHsc /std:c++20 /utf-8 /W3 /Zc:__cplusplus \
   /D_UNICODE /DUNICODE /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS \
   /D_DEBUG /MDd \
   /I"$WX\include" /I"$WX\include\msvc" /I"$MSVCINC" \
@@ -25,4 +26,6 @@ mkdir -p "$OUT"
   /Fo"$OUT\\" \
   "$SRC\main.cpp" "$SRC\mainframe.cpp" "$SRC\canvas.cpp" "$SRC\model.cpp" "$SRC\wirenet.cpp" "$SRC\netlist.cpp" "$SRC\eda.cpp" "${@:1}"
 
-echo "exit=$?"
+rc=$?
+echo "exit=$rc"
+exit "$rc"
