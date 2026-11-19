@@ -50,9 +50,10 @@
 
 ```bat
 set WXWIN=C:\wxWidgets-3.2.2.1
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Debug
-ctest --test-dir build -C Debug --output-on-failure
+set PATH=%WXWIN%\lib\vc14x_x64_dll;%PATH%
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 也可以直接用本目录的 VS 工程：设置 `WXWIN`（`Project1.vcxproj` 的 `WX_ROOT`

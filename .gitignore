@@ -6,7 +6,7 @@ Project1/Project1/x64/
 Project1/Project1.vcxproj.user
 _check/obj/
 _check/build/
-_check/cmake-build/
+_check/cmake-*/
 # Machine-local toolchain overrides for the _check scripts (see _check/env.sh).
 _check/env.local.sh
 _check/*.local.patch

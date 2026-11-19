@@ -6,9 +6,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# The prebuilt wxWidgets 3.2.2.1 developer package ships static *debug*
-# libraries (lib/vc_x64_lib/*ud.lib) and DLL *release* ones, and the project
-# has always been built in the debug flavour -- keep that the default.
+# The project has always been built in the debug flavour; keep that the
+# default.  wxWidgets trees differ: a source build offers static debug libs
+# (lib/vc_x64_lib/*ud.lib), the official prebuilt packages offer DLL import
+# libs for both mswud (debug) and mswu (release).  The library directory is
+# discovered below, so both layouts work.
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
@@ -24,9 +26,9 @@ endif()
 # libs those two depend on are resolved by FindwxWidgets.  The self-contained
 # static flavour is preferred; the DLL flavour is the fallback.
 #
-# The official prebuilt 3.2.2.1 packages pair flavours with build types
-# (lib/vc_x64_lib/mswud = static debug, lib/vc_x64_dll/mswu = DLL release),
-# so the debug/release decision follows CMAKE_BUILD_TYPE.
+# wxWidgets names its configurations mswud (debug) / mswu (release) in both
+# source builds and the official prebuilt packages, so the debug/release
+# decision follows CMAKE_BUILD_TYPE.
 if(CMAKE_BUILD_TYPE MATCHES "^[Dd]ebug")
     set(_LogicSim_wx_cfg "mswud")
 else()
@@ -38,17 +40,42 @@ if(NOT wxWidgets_ROOT_DIR AND DEFINED ENV{WXWIN})
     set(wxWidgets_ROOT_DIR "${_wxwin_root}" CACHE PATH "wxWidgets 3.2.2.1 tree")
     unset(_wxwin_root)
 endif()
+# Accept the Windows-style path a `set WXWIN=...` / -D usually supplies.
+if(wxWidgets_ROOT_DIR)
+    file(TO_CMAKE_PATH "${wxWidgets_ROOT_DIR}" _wxwin_norm)
+    set(wxWidgets_ROOT_DIR "${_wxwin_norm}" CACHE PATH "wxWidgets 3.2.2.1 tree" FORCE)
+    unset(_wxwin_norm)
+endif()
 
 # FindwxWidgets' find_path() ranks configuration NAMES above the PATHS order,
 # so with a prebuilt tree that has BOTH directories it always lands on
-# mswu (release DLL) even for a Debug build.  Pin the library directory
-# ourselves when the classic lib/vc_x64_{lib,dll} layout is present; vcpkg /
-# custom installs do not use that layout and keep the module's normal search.
+# mswu (release) even for a Debug build.  Pin the library directory ourselves.
+#
+# Do not assume the directory name: a source build uses vc_x64_lib / vc_x64_dll,
+# while the official prebuilt vc14x packages use vc14x_x64_dll only.  Scan
+# lib/*, prefer a static tree over a DLL one, and take the configuration that
+# matches the build type.  vcpkg / custom installs keep the module's normal
+# search when no classic lib/<dir>/<cfg>/wx/setup.h layout is present.
 if(NOT wxWidgets_LIB_DIR AND wxWidgets_ROOT_DIR)
-    foreach(_wx_dir vc_x64_lib vc_x64_dll)
-        if(EXISTS "${wxWidgets_ROOT_DIR}/lib/${_wx_dir}/${_LogicSim_wx_cfg}/wx/setup.h")
-            set(wxWidgets_LIB_DIR "${wxWidgets_ROOT_DIR}/lib/${_wx_dir}"
-                CACHE PATH "wxWidgets library directory")
+    file(GLOB _LogicSim_wx_libs LIST_DIRECTORIES true
+         "${wxWidgets_ROOT_DIR}/lib/*")
+    set(_LogicSim_wx_static "")
+    set(_LogicSim_wx_shared "")
+    foreach(_wx_dir IN LISTS _LogicSim_wx_libs)
+        if(NOT IS_DIRECTORY "${_wx_dir}")
+            continue()
+        endif()
+        get_filename_component(_wx_name "${_wx_dir}" NAME)
+        if(_wx_name MATCHES "[dD][lL][lL]")
+            list(APPEND _LogicSim_wx_shared "${_wx_dir}")
+        else()
+            list(APPEND _LogicSim_wx_static "${_wx_dir}")
+        endif()
+    endforeach()
+
+    foreach(_wx_dir IN LISTS _LogicSim_wx_static _LogicSim_wx_shared)
+        if(EXISTS "${_wx_dir}/${_LogicSim_wx_cfg}/wx/setup.h")
+            set(wxWidgets_LIB_DIR "${_wx_dir}" CACHE PATH "wxWidgets library directory")
             set(_LogicSim_wx_found_cfg "${_LogicSim_wx_cfg}")
             break()
         endif()
@@ -57,11 +84,10 @@ if(NOT wxWidgets_LIB_DIR AND wxWidgets_ROOT_DIR)
     # tell FindwxWidgets about it -- otherwise the module silently picks the
     # last directory it finds instead of the flavour we just selected.
     if(NOT wxWidgets_LIB_DIR)
-        foreach(_wx_dir vc_x64_lib vc_x64_dll)
+        foreach(_wx_dir IN LISTS _LogicSim_wx_static _LogicSim_wx_shared)
             foreach(_wx_any_cfg mswu mswud mswd msw)
-                if(EXISTS "${wxWidgets_ROOT_DIR}/lib/${_wx_dir}/${_wx_any_cfg}/wx/setup.h")
-                    set(wxWidgets_LIB_DIR "${wxWidgets_ROOT_DIR}/lib/${_wx_dir}"
-                        CACHE PATH "wxWidgets library directory")
+                if(EXISTS "${_wx_dir}/${_wx_any_cfg}/wx/setup.h")
+                    set(wxWidgets_LIB_DIR "${_wx_dir}" CACHE PATH "wxWidgets library directory")
                     set(_LogicSim_wx_found_cfg "${_wx_any_cfg}")
                     break()
                 endif()
@@ -75,6 +101,11 @@ if(NOT wxWidgets_LIB_DIR AND wxWidgets_ROOT_DIR)
         set(wxWidgets_CONFIGURATION "${_LogicSim_wx_found_cfg}"
             CACHE STRING "wxWidgets configuration")
     endif()
+    unset(_LogicSim_wx_libs)
+    unset(_LogicSim_wx_static)
+    unset(_LogicSim_wx_shared)
+    unset(_wx_dir)
+    unset(_wx_name)
 endif()
 
 set(_LogicSim_wx_components core base adv html xml xrc propgrid)
